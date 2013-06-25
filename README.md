@@ -7,4 +7,6 @@ I’ve cut a lot of corners in this implementation, like:
 - an inserted value cannot contain a \n
 - It is not demonizing yet
 
+The code contains a lot of antipatterns.
+
 http://blog.postmaster.gr/2012/03/20/memcached-pl-an-incomplete-implementation-in-perl-with-persistence/
