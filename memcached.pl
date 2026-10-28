@@ -450,6 +450,7 @@ sub m_append {
 		return;
 	}
 
+	$casunique = set_casunique();
 	$data = freeze $oflags, $oexptime, length($val), $casunique, $val;
 	$lock = $db->cds_lock();
 	$cache{$key} = $data;
