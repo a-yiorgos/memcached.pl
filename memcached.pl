@@ -3,8 +3,6 @@
 # An implementation of the memcached text protocol
 # (http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt)
 # in Perl with persistence using BerkeleyDB.
-#
-# Useful for debugging and / or testing purposes, not for production.
 
 use strict;
 use warnings;
@@ -12,20 +10,23 @@ use warnings;
 use BerkeleyDB;
 use IO::Socket;
 use FreezeThaw qw(freeze thaw);
-use POSIX qw(:sys_wait_h);
+use POSIX qw(:sys_wait_h _exit);
+use Getopt::Long;
+use File::Path qw(make_path);
+use Math::BigInt;
 
-# Global variables.
-our (
-	$pid,
-	$month,
-	$env,
-	$db,
-	%cache,
-	$sock,
-	$nsock,
-	$cmd,
-	@line
-);
+# Options with defaults
+my $listen_addr = '127.0.0.1';
+my $port        = 11311;
+my $dbdir       = './data';
+
+GetOptions(
+	'listen=s' => \$listen_addr,
+	'port=i'   => \$port,
+	'dbdir=s'  => \$dbdir,
+) or die "Error in command line arguments\n";
+
+make_path($dbdir) unless -d $dbdir;
 
 # Signal handler for forked children.
 sub REAPER {
@@ -33,32 +34,117 @@ sub REAPER {
 	$SIG{CHLD} = \&REAPER;
 }
 
-# Request a new CAS value.
-sub set_casunique {
-	my $casunique;
+$SIG{CHLD} = \&REAPER;
 
-	print TO_CHILD "get\n";
-	$casunique = <FROM_CHILD>;
-	if (defined $casunique) {
-		chomp($casunique);
-	} else {
-		$casunique = 1;
+# One month in seconds (30 days * 24 hours * 60 mins * 60 secs)
+my $month = 60 * 60 * 24 * 30;
+
+# Initialise DB in parent to set up environment and CAS counter
+{
+	my (%parent_cache, %parent_cas);
+	my $p_env = new BerkeleyDB::Env(
+		-Home  => $dbdir,
+		-Flags => DB_CREATE | DB_INIT_CDB | DB_INIT_MPOOL
+	) or die "cannot open environment: $BerkeleyDB::Error\n";
+
+	my $p_db = tie %parent_cache, 'BerkeleyDB::Hash',
+		-Filename => 'memcache.db',
+		-Flags    => DB_CREATE,
+		-Env      => $p_env
+		or die "cannot open database: $BerkeleyDB::Error\n";
+
+	my $p_cas_db = tie %parent_cas, 'BerkeleyDB::Hash',
+		-Filename => 'cas.db',
+		-Flags    => DB_CREATE,
+		-Env      => $p_env
+		or die "cannot open cas database: $BerkeleyDB::Error\n";
+
+	my $max_cas = 0;
+	foreach my $key (keys %parent_cache) {
+		if (defined $parent_cache{$key}) {
+			my ($flags, $exptime, $bytes, $casunique, $val) = thaw $parent_cache{$key};
+			if (defined $casunique && $casunique > $max_cas) {
+				$max_cas = $casunique;
+			}
+		}
 	}
 
-	return $casunique;
+	my $cur_cas = $parent_cas{'counter'} // 0;
+	if ($max_cas >= $cur_cas) {
+		$parent_cas{'counter'} = $max_cas;
+	}
+
+	undef $p_db;
+	untie %parent_cache;
+	undef $p_cas_db;
+	untie %parent_cas;
+	undef $p_env;
 }
 
-# Read exact payload bytes from socket.
+# Validation helpers
+sub is_valid_key {
+	my ($k) = @_;
+	return 0 unless defined $k;
+	return ($k =~ /^[\x21-\x7e]{1,250}$/) ? 1 : 0;
+}
+
+sub is_valid_flags {
+	my ($f) = @_;
+	return 0 unless defined $f && $f =~ /^\d+$/;
+	return (length($f) < 10 || ($f cmp "4294967295") <= 0) ? 1 : 0 if length($f) <= 10;
+	return 0;
+}
+
+sub is_valid_exptime {
+	my ($e) = @_;
+	return 0 unless defined $e && $e =~ /^-?\d+$/;
+	return 1;
+}
+
+sub is_valid_bytes {
+	my ($b) = @_;
+	return 0 unless defined $b && $b =~ /^\d+$/;
+	return 1;
+}
+
+sub is_valid_uint64 {
+	my ($v) = @_;
+	return 0 unless defined $v && $v =~ /^\d+$/;
+	return (length($v) < 20 || ($v cmp "18446744073709551615") <= 0) ? 1 : 0 if length($v) <= 20;
+	return 0;
+}
+
+sub parse_exptime {
+	my ($exptime) = @_;
+	if ($exptime < 0) {
+		return -1; # Expired
+	} elsif ($exptime == 0) {
+		return 0;
+	} elsif ($exptime <= $month) {
+		return time() + $exptime;
+	} else {
+		return $exptime;
+	}
+}
+
+sub next_cas {
+	my ($cas_store_ref) = @_;
+	my $c = $cas_store_ref->{'counter'} // 0;
+	$c++;
+	$cas_store_ref->{'counter'} = $c;
+	return $c;
+}
+
 sub read_bytes {
-	my ($bytes) = @_;
+	my ($nsock, $bytes) = @_;
 	my $data = '';
 	my $read_len = 0;
 
 	while ($read_len < $bytes) {
-		my $buffer;
+		my $buffer = '';
 		my $n = read($nsock, $buffer, $bytes - $read_len);
 		if (!defined $n || $n == 0) {
-			return undef; # Socket closed or error
+			return (undef, "EOF");
 		}
 		$data .= $buffer;
 		$read_len += $n;
@@ -66,606 +152,541 @@ sub read_bytes {
 
 	# Read trailing \r\n
 	my $crlf = '';
-	read($nsock, $crlf, 2);
-
-	return $data;
-}
-
-# set a key value.
-sub m_set {
-	my $noreply;
-	my $len = @line;
-	my $lock;
-	my $key;
-	my ($data, $flags, $exptime, $bytes, $casunique, $val);
-
-	if (($len == 4) or ($len == 5)) {
-		$key = shift(@line);
-		$flags = shift(@line);
-		$exptime = shift(@line);
-		$bytes = shift(@line);
-		if ($len == 5) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-			}
+	my $c_read = 0;
+	while ($c_read < 2) {
+		my $buf = '';
+		my $n = read($nsock, $buf, 2 - $c_read);
+		if (!defined $n || $n == 0) {
+			return (undef, "EOF");
 		}
-	} else {
-		print $nsock "ERROR\r\n";
-		return;
+		$crlf .= $buf;
+		$c_read += $n;
 	}
 
-	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+	if ($crlf ne "\r\n") {
+		my $buf = '';
+		while (read($nsock, $buf, 1)) {
+			last if $buf eq "\n";
+		}
+		return (undef, "BAD_CHUNK");
+	}
+
+	return ($data, "OK");
+}
+
+sub handle_storage {
+	my ($nsock, $db, $cache_ref, $cas_store_ref, $mode, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
+
+	my $noreply;
+	if (@tokens > 0 && $tokens[-1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
+	}
+
+	my $bytes_to_read;
+	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
+		$bytes_to_read = $tokens[3];
+	}
+
+	my $cmd_valid = (@tokens == 4);
+	my ($key, $flags, $exptime, $bytes);
+	if ($cmd_valid) {
+		($key, $flags, $exptime, $bytes) = @tokens;
+		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes));
+	}
+
+	if (defined $bytes_to_read) {
+		my ($val, $err) = read_bytes($nsock, $bytes_to_read);
+		if (!defined $val) {
+			if ($err eq "BAD_CHUNK") {
+				print $nsock "CLIENT_ERROR bad data chunk\r\n";
+			}
+			return;
+		}
+		if (!$cmd_valid) {
+			print $nsock "CLIENT_ERROR bad command line format\r\n";
+			return;
+		}
+
+		my $real_exptime = parse_exptime($exptime);
+
+		my $lock = $db->cds_lock();
+		if (defined $cache_ref->{$key}) {
+			my ($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
+			if ($oexptime != 0 && $oexptime < time()) {
+				delete $cache_ref->{$key};
+			}
+		}
+
+		if ($mode eq "add" && defined $cache_ref->{$key}) {
+			undef $lock;
+			print $nsock "NOT_STORED\r\n" unless $noreply;
+			return;
+		}
+		if ($mode eq "replace" && !defined $cache_ref->{$key}) {
+			undef $lock;
+			print $nsock "NOT_STORED\r\n" unless $noreply;
+			return;
+		}
+
+		my $casunique = next_cas($cas_store_ref);
+		my $data = freeze $flags, $real_exptime, $bytes, $casunique, $val;
+		$cache_ref->{$key} = $data;
+		undef $lock;
+		print $nsock "STORED\r\n" unless $noreply;
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+	}
+}
+
+sub handle_cas {
+	my ($nsock, $db, $cache_ref, $cas_store_ref, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
+
+	my $noreply;
+	if (@tokens > 0 && $tokens[-1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
+	}
+
+	my $bytes_to_read;
+	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
+		$bytes_to_read = $tokens[3];
+	}
+
+	my $cmd_valid = (@tokens == 5);
+	my ($key, $flags, $exptime, $bytes, $casunique);
+	if ($cmd_valid) {
+		($key, $flags, $exptime, $bytes, $casunique) = @tokens;
+		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes) && is_valid_uint64($casunique));
+	}
+
+	if (defined $bytes_to_read) {
+		my ($val, $err) = read_bytes($nsock, $bytes_to_read);
+		if (!defined $val) {
+			if ($err eq "BAD_CHUNK") {
+				print $nsock "CLIENT_ERROR bad data chunk\r\n";
+			}
+			return;
+		}
+		if (!$cmd_valid) {
+			print $nsock "CLIENT_ERROR bad command line format\r\n";
+			return;
+		}
+
+		my $real_exptime = parse_exptime($exptime);
+
+		my $lock = $db->cds_lock();
+		my ($oflags, $oexptime, $obytes, $ocas, $oval);
+		if (defined $cache_ref->{$key}) {
+			($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
+			if ($oexptime != 0 && $oexptime < time()) {
+				delete $cache_ref->{$key};
+			}
+		}
+
+		if (!defined $cache_ref->{$key}) {
+			undef $lock;
+			print $nsock "NOT_FOUND\r\n" unless $noreply;
+			return;
+		}
+
+		if ($casunique ne $ocas) {
+			undef $lock;
+			print $nsock "EXISTS\r\n" unless $noreply;
+			return;
+		}
+
+		my $new_cas = next_cas($cas_store_ref);
+		my $data = freeze $flags, $real_exptime, $bytes, $new_cas, $val;
+		$cache_ref->{$key} = $data;
+		undef $lock;
+		print $nsock "STORED\r\n" unless $noreply;
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+	}
+}
+
+sub handle_append_prepend {
+	my ($nsock, $db, $cache_ref, $cas_store_ref, $mode, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
+
+	my $noreply;
+	if (@tokens > 0 && $tokens[-1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
+	}
+
+	my $bytes_to_read;
+	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
+		$bytes_to_read = $tokens[3];
+	}
+
+	my $cmd_valid = (@tokens == 4);
+	my ($key, $flags, $exptime, $bytes);
+	if ($cmd_valid) {
+		($key, $flags, $exptime, $bytes) = @tokens;
+		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes));
+	}
+
+	if (defined $bytes_to_read) {
+		my ($val, $err) = read_bytes($nsock, $bytes_to_read);
+		if (!defined $val) {
+			if ($err eq "BAD_CHUNK") {
+				print $nsock "CLIENT_ERROR bad data chunk\r\n";
+			}
+			return;
+		}
+		if (!$cmd_valid) {
+			print $nsock "CLIENT_ERROR bad command line format\r\n";
+			return;
+		}
+
+		my $lock = $db->cds_lock();
+		my ($oflags, $oexptime, $obytes, $ocas, $oval);
+		if (defined $cache_ref->{$key}) {
+			($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
+			if ($oexptime != 0 && $oexptime < time()) {
+				delete $cache_ref->{$key};
+			}
+		}
+
+		if (!defined $cache_ref->{$key}) {
+			undef $lock;
+			print $nsock "NOT_FOUND\r\n" unless $noreply;
+			return;
+		}
+
+		my $new_val = ($mode eq "append") ? $oval . $val : $val . $oval;
+		my $new_cas = next_cas($cas_store_ref);
+		my $data = freeze $oflags, $oexptime, length($new_val), $new_cas, $new_val;
+		$cache_ref->{$key} = $data;
+		undef $lock;
+		print $nsock "STORED\r\n" unless $noreply;
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+	}
+}
+
+sub handle_get {
+	my ($nsock, $db, $cache_ref, $mode, $line_str) = @_;
+	my @keys = split(' ', $line_str, -1);
+
+	if (@keys == 0) {
 		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	$val = read_bytes($bytes);
-	if (!defined $val) {
-		print $nsock "CLIENT_ERROR bad data chunk\r\n";
-		return;
-	}
-
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
-		$exptime += time();
-	}
-
-	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
-
-	$lock = $db->cds_lock();
-	$cache{$key} = $data;
-	$lock->cds_unlock();
-	print $nsock "STORED\r\n" unless(defined($noreply));
-
-	return;
-}
-
-# check and set a key value.
-sub m_cas {
-	my $noreply;
-	my $len = @line;
-	my $lock;
-	my $key;
-	my ($data, $flags, $exptime, $bytes, $casunique, $val);
-	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
-
-	if (($len == 5) or ($len == 6)) {
-		$key = shift(@line);
-		$flags = shift(@line);
-		$exptime = shift(@line);
-		$bytes = shift(@line);
-		$casunique = shift(@line);
-		if ($len == 6) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-			}
-		}
-	} else {
-		print $nsock "ERROR\r\n";
-		return;
-	}
-
-	if (!defined($bytes) || $bytes !~ /^\d+$/) {
-		print $nsock "CLIENT_ERROR bad command line format\r\n";
-		return;
-	}
-
-	$val = read_bytes($bytes);
-	if (!defined $val) {
-		print $nsock "CLIENT_ERROR bad data chunk\r\n";
-		return;
-	}
-
-	# Check whether the key has actually expired first
-	if (defined($cache{$key})) {
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
-		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
-			delete $cache{$key};
-			$lock->cds_unlock();
+	for my $k (@keys) {
+		if (!is_valid_key($k)) {
+			print $nsock "CLIENT_ERROR bad command line format\r\n";
+			return;
 		}
 	}
 
-	if (!defined($cache{$key})) {
-		print $nsock "NOT_FOUND\r\n";
-		return;
-	}
-
-	if ($casunique != $ocasunique) {
-		print $nsock "EXISTS\r\n";
-		return;
-	}
-
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
-		$exptime += time();
-	}
-
-	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
-
-	$lock = $db->cds_lock();
-	$cache{$key} = $data;
-	$lock->cds_unlock();
-	print $nsock "STORED\r\n" unless(defined($noreply));
-
-	return;
-}
-
-# get a key value.
-sub m_get {
-	my $mode = shift(@_);
-	my $len = @line;
-	my $lock;
-	my $key;
-	my ($flags, $exptime, $bytes, $casunique, $val);
-
-	if ($len == 0) {
-		print $nsock "ERROR\r\n";
-		return;
-	}
-
-	# get the keys
-	while ($key = shift(@line)) {
-		if (defined($cache{$key})) {
-			# Check whether the key has actually expired first
-			($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
-			if (($exptime != 0) and ($exptime < time())) {
-				$lock = $db->cds_lock();
-				delete $cache{$key};
-				$lock->cds_unlock();
+	my $lock = $db->cds_lock();
+	while (defined(my $key = shift(@keys))) {
+		if (defined $cache_ref->{$key}) {
+			my ($flags, $exptime, $bytes, $casunique, $val) = thaw $cache_ref->{$key};
+			if ($exptime != 0 && $exptime < time()) {
+				delete $cache_ref->{$key};
 			} else {
 				if ($mode eq "get") {
 					print $nsock "VALUE $key $flags $bytes\r\n";
 				} elsif ($mode eq "gets") {
 					print $nsock "VALUE $key $flags $bytes $casunique\r\n";
-				} else {
-					print $nsock "CLIENT_ERROR cannot $mode\r\n";
-					return;
 				}
 				print $nsock $val, "\r\n";
 			}
 		}
 	}
-
+	undef $lock;
 	print $nsock "END\r\n";
-	return;
 }
 
-# add / replace a key if it does not already exist
-sub m_add {
-	my $noreply;
-	my $mode = shift(@_);
-	my $len = @line;
-	my $lock;
-	my $key;
-	my ($data, $flags, $exptime, $bytes, $casunique, $val);
-	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
+sub handle_delete {
+	my ($nsock, $db, $cache_ref, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
 
-	if (($len == 4) or ($len == 5)) {
-		$key = shift(@line);
-		$flags = shift(@line);
-		$exptime = shift(@line);
-		$bytes = shift(@line);
-		if ($len == 5) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-			}
-		}
-	} else {
-		print $nsock "ERROR\r\n";
-		return;
+	my $noreply;
+	if (@tokens > 0 && $tokens[-1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
 	}
 
-	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+	if (@tokens != 1) {
 		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	$val = read_bytes($bytes);
-	if (!defined $val) {
-		print $nsock "CLIENT_ERROR bad data chunk\r\n";
+	my $key = $tokens[0];
+
+	if (!is_valid_key($key)) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	# Check whether the key has actually expired first.
-	if (defined($cache{$key})) {
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
-		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
-			delete $cache{$key};
-			$lock->cds_unlock();
+	my $lock = $db->cds_lock();
+	if (defined $cache_ref->{$key}) {
+		my ($flags, $exptime, $bytes, $cas, $val) = thaw $cache_ref->{$key};
+		if ($exptime != 0 && $exptime < time()) {
+			delete $cache_ref->{$key};
 		}
 	}
 
-	if (($mode eq "add") and (defined($cache{$key}))) {
-		print $nsock "NOT_STORED\r\n" unless(defined($noreply));
+	if (!defined $cache_ref->{$key}) {
+		undef $lock;
+		print $nsock "NOT_FOUND\r\n" unless $noreply;
 		return;
 	}
 
-	if (($mode eq "replace") and (!defined($cache{$key}))) {
-		print $nsock "NOT_STORED\r\n" unless(defined($noreply));
-		return;
-	}
-
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
-		$exptime += time();
-	}
-
-	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
-
-	$lock = $db->cds_lock();
-	$cache{$key} = $data;
-	$lock->cds_unlock();
-	print $nsock "STORED\r\n" unless(defined($noreply));
-
-	return;
+	delete $cache_ref->{$key};
+	undef $lock;
+	print $nsock "DELETED\r\n" unless $noreply;
 }
 
-# delete a key if it exists.
-sub m_delete {
+sub handle_incr_decr {
+	my ($nsock, $db, $cache_ref, $cas_store_ref, $mode, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
+
 	my $noreply;
-	my $len = @line;
-	my $lock;
-	my $key;
+	if (@tokens > 0 && $tokens[-1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
+	}
 
-	if (($len == 1) or ($len == 2)) {
-		$key = shift(@line);
-		if ($len == 2) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-				print $nsock "CLIENT_ERROR bad command line format.  Usage: delete \<key\> [noreply]\r\n";
-				return;
-			}
+	if (@tokens != 2) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	my ($key, $delta) = @tokens;
+
+	if (!is_valid_key($key) || !is_valid_uint64($delta)) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	my $lock = $db->cds_lock();
+	my ($flags, $exptime, $bytes, $cas, $val);
+	if (defined $cache_ref->{$key}) {
+		($flags, $exptime, $bytes, $cas, $val) = thaw $cache_ref->{$key};
+		if ($exptime != 0 && $exptime < time()) {
+			delete $cache_ref->{$key};
 		}
+	}
+
+	if (!defined $cache_ref->{$key}) {
+		undef $lock;
+		print $nsock "NOT_FOUND\r\n" unless $noreply;
+		return;
+	}
+
+	if ($val !~ /^\d+$/) {
+		undef $lock;
+		print $nsock "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n";
+		return;
+	}
+
+	my $b_val   = Math::BigInt->new($val);
+	my $b_delta = Math::BigInt->new($delta);
+	my $mod     = Math::BigInt->new("18446744073709551616");
+
+	if ($mode eq "incr") {
+		$b_val->badd($b_delta);
+		$b_val->bmod($mod);
 	} else {
-		print $nsock "ERROR\r\n";
+		$b_val->bsub($b_delta);
+		if ($b_val->is_neg()) {
+			$b_val = Math::BigInt->new(0);
+		}
+	}
+
+	my $new_val = $b_val->bstr();
+	my $new_cas = next_cas($cas_store_ref);
+	$cache_ref->{$key} = freeze $flags, $exptime, length($new_val), $new_cas, $new_val;
+	undef $lock;
+
+	print $nsock "$new_val\r\n" unless $noreply;
+}
+
+sub handle_flush_all {
+	my ($nsock, $db, $cache_ref, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
+
+	my $noreply;
+	if (@tokens == 1 && $tokens[0] eq 'noreply') {
+		$noreply = 1;
+	} elsif (@tokens > 0) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	if (!defined($cache{$key})) {
-		print $nsock "NOT_FOUND\r\n";
+	my $lock = $db->cds_lock();
+	foreach my $key (keys %$cache_ref) {
+		delete $cache_ref->{$key};
+	}
+	undef $lock;
+
+	print $nsock "OK\r\n" unless $noreply;
+}
+
+sub handle_show_all {
+	my ($nsock, $db, $cache_ref, $line_str) = @_;
+	if (length $line_str > 0) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	$lock = $db->cds_lock();
-	delete $cache{$key};
-	$lock->cds_unlock();
-	print $nsock "DELETED\r\n" unless defined($noreply);
-
-	return;
-}
-
-# flush all keys from the database
-sub m_flush_all {
-	my $lock;
-	my $key;
-
-	$lock = $db->cds_lock();
-	foreach $key (keys %cache) {
-		delete $cache{$key};
-	}
-	$lock->cds_unlock();
-	print $nsock "OK\r\n";
-
-	return;
-}
-
-# show all keys in database
-sub m_show_all {
-	my $lock;
-	my $key;
-	my ($flags, $exptime, $bytes, $casunique, $val);
-
-	$lock = $db->cds_lock();
-	foreach $key (keys %cache) {
-		if (defined($cache{$key})) {
-			# Check whether the key has actually expired first
-			($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
-			if (($exptime != 0) and ($exptime < time())) {
-				delete $cache{$key};
+	my $lock = $db->cds_lock();
+	foreach my $key (keys %$cache_ref) {
+		if (defined $cache_ref->{$key}) {
+			my ($flags, $exptime, $bytes, $casunique, $val) = thaw $cache_ref->{$key};
+			if ($exptime != 0 && $exptime < time()) {
+				delete $cache_ref->{$key};
 			} else {
 				print $nsock "VALUE $key $flags $bytes\r\n";
 				print $nsock $val, "\r\n";
 			}
 		}
 	}
-	$lock->cds_unlock();
+	undef $lock;
 	print $nsock "END\r\n";
-
-	return;
 }
 
-# append / prepend data to key value
-sub m_append {
-	my $noreply;
-	my $len = @line;
-	my $mode = shift(@_);
-	my $lock;
-	my $key;
-	my ($data, $flags, $exptime, $bytes, $casunique, $val);
-	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
+sub handle_verbosity {
+	my ($nsock, $line_str) = @_;
+	my @tokens = split(' ', $line_str, -1);
 
-	if (($len == 4) or ($len == 5)) {
-		$key = shift(@line);
-		$flags = shift(@line);
-		$exptime = shift(@line);
-		$bytes = shift(@line);
-		if ($len == 5) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-			}
-		}
-	} else {
-		print $nsock "ERROR\r\n";
-		return;
+	my $noreply;
+	if (@tokens == 2 && $tokens[1] eq 'noreply') {
+		$noreply = 1;
+		pop @tokens;
 	}
 
-	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+	if (@tokens != 1 || $tokens[0] !~ /^\d+$/) {
 		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	$val = read_bytes($bytes);
-	if (!defined $val) {
-		print $nsock "CLIENT_ERROR bad data chunk\r\n";
-		return;
-	}
-
-	if (defined($cache{$key})) {
-		# Check whether the key has actually expired first
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
-		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
-			delete $cache{$key};
-			$lock->cds_unlock();
-			print $nsock "NOT_FOUND\r\n" unless defined($noreply);
-			return;
-		}
-	} else {
-		print $nsock "NOT_FOUND\r\n" unless defined($noreply);
-		return;
-	}
-
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
-		$exptime += time();
-	}
-
-	$casunique = set_casunique();
-	if ($mode eq "append") {
-		$val = $oval . $val;
-	} elsif ($mode eq "prepend") {
-		$val = $val . $oval;
-	} else {
-		print $nsock "CLIENT_ERROR cannot $mode\r\n";
-		return;
-	}
-
-	$casunique = set_casunique();
-	$data = freeze $oflags, $oexptime, length($val), $casunique, $val;
-	$lock = $db->cds_lock();
-	$cache{$key} = $data;
-	$lock->cds_unlock();
-	print $nsock "STORED\r\n" unless defined($noreply);
-
-	return;
+	print $nsock "OK\r\n" unless $noreply;
 }
-
-# verbosity dummy function
-sub m_verbosity {
-	my $noreply;
-
-	if (@line) {
-		$noreply = $line[$#line];
-		if ($noreply ne "noreply") {
-			undef($noreply);
-		}
-	}
-
-	print $nsock "OK\r\n" unless defined($noreply);
-
-	return;
-}
-
-# increment / decrement the numeric value of a key
-sub m_incr {
-	my $noreply;
-	my $len = @line;
-	my $num;
-	my $mode = shift(@_);
-	my $lock;
-	my $key;
-	my ($flags, $exptime, $bytes, $casunique, $val);
-
-	if (($len == 2) or ($len == 3)) {
-		$key = shift(@line);
-		$num = shift(@line);
-		if ($len == 3) {
-			$noreply = shift(@line);
-			if ($noreply ne "noreply") {
-				undef($noreply);
-			}
-		}
-	} else {
-		print $nsock "ERROR\r\n";
-		return;
-	}
-
-	if (!($num =~ m/^\d+$/)) {
-		print $nsock "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n";
-		return;
-	}
-
-	# Check whether the key has actually expired first
-	if (defined($cache{$key})) {
-		($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
-		if (($exptime != 0) and ($exptime < time())) {
-			$lock = $db->cds_lock();
-			delete $cache{$key};
-			$lock->cds_unlock();
-		}
-	}
-
-	if (!defined($cache{$key})) {
-		print $nsock "NOT_FOUND\r\n";
-		return;
-	}
-
-	if (!($val =~ m/^\d+$/)) {
-		print $nsock "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n";
-		return;
-	}
-
-	if ($mode eq "incr") {
-		$val += $num;
-	} elsif ($mode eq "decr") {
-		$val -= $num;
-		$val = 0 unless ($val > 0);
-	} else {
-		print $nsock "CLIENT_ERROR cannot $mode\r\n";
-		return;
-	}
-
-	$casunique = set_casunique();
-	$lock = $db->cds_lock();
-	$cache{$key} = freeze $flags, $exptime, length($val), $casunique, $val;
-	$lock->cds_unlock();
-	print $nsock $val, "\r\n";
-
-	return;
-}
-
-# Set the signal handler.
-$SIG{CHLD} = \&REAPER;
-
-# One month in seconds (30 days * 24 hours * 60 mins * 60 secs)
-$month = 60 * 60 * 24 * 30;
-
-# Create a database environment
-$env = new BerkeleyDB::Env (
-	-Home => '/tmp',
-	-Flags  => DB_CREATE | DB_INIT_CDB | DB_INIT_MPOOL)
-	or die "cannot open environment: $BerkeleyDB::Error\n";
-
-# Open the data store.
-$db = tie %cache, 'BerkeleyDB::Hash', 
-	-Filename => 'memcache.db',
-	-Flags => DB_CREATE ,
-	-Env => $env
-	or die "cannot open database: $BerkeleyDB::Error\n";
-
-# Create pipes for CAS value production child process.
-pipe(FROM_PARENT, TO_CHILD) or die "cannot pipe: $!\n";
-pipe(FROM_CHILD, TO_PARENT) or die "cannot pipe: $!\n";
-TO_CHILD->autoflush(1);
-TO_PARENT->autoflush(1);
-
-$pid = fork();
-die "Cannot fork: $!" unless defined($pid);
-if ($pid == 0) {
-	# Child process: generates unique CAS numbers.
-	close(FROM_CHILD);
-	close(TO_CHILD);
-
-	my $key;
-	my ($flags, $exptime, $bytes, $casunique, $ocasunique, $val);
-	my $cas_counter = 1;
-
-	foreach $key (keys %cache) {
-		if (defined $cache{$key}) {
-			($flags, $exptime, $bytes, $ocasunique, $val) = thaw $cache{$key};
-			if (defined $ocasunique && $ocasunique > $cas_counter) {
-				$cas_counter = $ocasunique;
-			}
-		}
-	}
-
-	while (<FROM_PARENT>) {
-		$cas_counter++;
-		print TO_PARENT $cas_counter, "\n";
-	}
-	exit 0;
-}
-
-close(FROM_PARENT);
-close(TO_PARENT);
 
 # Create a listener socket.
-$sock = new IO::Socket::INET (
-	LocalHost => '127.0.0.1:11311',
-	Proto => 'tcp',
-	Listen => 10,
-	ReuseAddr => 1) or die "cannot open socket: $!\n";
+my $sock = new IO::Socket::INET(
+	LocalAddr => "$listen_addr:$port",
+	Proto     => 'tcp',
+	Listen    => 128,
+	ReuseAddr => 1
+) or die "cannot open socket on $listen_addr:$port: $!\n";
 
 # Main connection acceptance loop
 while (1) {
-	$nsock = $sock->accept();
+	my $nsock = $sock->accept();
 	next unless defined $nsock;
 
-	$pid = fork();
+	my $pid = fork();
 	die "Cannot fork: $!" unless defined($pid);
+
 	if ($pid == 0) {
 		# Worker child process
 		close($sock);
+		$nsock->autoflush(1);
+
+		# Open worker's own BerkeleyDB environment and databases
+		my (%cache, %cas_store);
+		my $env = new BerkeleyDB::Env(
+			-Home  => $dbdir,
+			-Flags => DB_CREATE | DB_INIT_CDB | DB_INIT_MPOOL
+		) or die "cannot open environment in worker: $BerkeleyDB::Error\n";
+
+		my $db = tie %cache, 'BerkeleyDB::Hash',
+			-Filename => 'memcache.db',
+			-Flags    => DB_CREATE,
+			-Env      => $env
+			or die "cannot open database in worker: $BerkeleyDB::Error\n";
+
+		my $cas_db = tie %cas_store, 'BerkeleyDB::Hash',
+			-Filename => 'cas.db',
+			-Flags    => DB_CREATE,
+			-Env      => $env
+			or die "cannot open cas database in worker: $BerkeleyDB::Error\n";
 
 		while (my $raw_line = <$nsock>) {
 			$raw_line =~ s/[\r\n]+$//;
-			next if $raw_line eq '';
 
-			@line = split(/\s+/, $raw_line);
-			$cmd = shift(@line);
-			next unless defined $cmd;
+			my $trimmed = $raw_line;
+			$trimmed =~ s/^\s+//;
+			$trimmed =~ s/\s+$//;
+			if ($trimmed eq '') {
+				if (!defined $raw_line) {
+					undef $db; untie %cache;
+					undef $cas_db; untie %cas_store;
+					undef $env;
+					close($nsock);
+					POSIX::_exit(0);
+				}
+				next;
+			}
+
+			my ($cmd, $rest) = split(/\s+/, $trimmed, 2);
+			$rest //= '';
 
 			if ($cmd eq "quit") {
-				close($nsock);
-				exit 0;
+				if (length $rest > 0) {
+					print $nsock "CLIENT_ERROR bad command line format\r\n";
+				} else {
+					undef $db; untie %cache;
+					undef $cas_db; untie %cas_store;
+					undef $env;
+					close($nsock);
+					POSIX::_exit(0);
+				}
 			} elsif ($cmd eq "version") {
-				print $nsock "VERSION memcached.pl v0.1\r\n";
+				if (length $rest > 0) {
+					print $nsock "CLIENT_ERROR bad command line format\r\n";
+				} else {
+					print $nsock "VERSION memcached.pl v0.1\r\n";
+				}
 			} elsif ($cmd eq "set") {
-				m_set();
-			} elsif ($cmd eq "get") {
-				m_get("get");
+				handle_storage($nsock, $db, \%cache, \%cas_store, "set", $rest);
 			} elsif ($cmd eq "add") {
-				m_add("add");
+				handle_storage($nsock, $db, \%cache, \%cas_store, "add", $rest);
 			} elsif ($cmd eq "replace") {
-				m_add("replace");
+				handle_storage($nsock, $db, \%cache, \%cas_store, "replace", $rest);
 			} elsif ($cmd eq "append") {
-				m_append("append");
+				handle_append_prepend($nsock, $db, \%cache, \%cas_store, "append", $rest);
 			} elsif ($cmd eq "prepend") {
-				m_append("prepend");
+				handle_append_prepend($nsock, $db, \%cache, \%cas_store, "prepend", $rest);
 			} elsif ($cmd eq "cas") {
-				m_cas();
+				handle_cas($nsock, $db, \%cache, \%cas_store, $rest);
+			} elsif ($cmd eq "get") {
+				handle_get($nsock, $db, \%cache, "get", $rest);
 			} elsif ($cmd eq "gets") {
-				m_get("gets");
+				handle_get($nsock, $db, \%cache, "gets", $rest);
 			} elsif ($cmd eq "delete") {
-				m_delete();
+				handle_delete($nsock, $db, \%cache, $rest);
 			} elsif ($cmd eq "incr") {
-				m_incr("incr");
+				handle_incr_decr($nsock, $db, \%cache, \%cas_store, "incr", $rest);
 			} elsif ($cmd eq "decr") {
-				m_incr("decr");
-			} elsif ($cmd eq "stats") {
-				print $nsock "SERVER_ERROR command not implemented.\r\n";
+				handle_incr_decr($nsock, $db, \%cache, \%cas_store, "decr", $rest);
 			} elsif ($cmd eq "flush_all") {
-				m_flush_all();
+				handle_flush_all($nsock, $db, \%cache, $rest);
 			} elsif ($cmd eq "show_all") {
-				m_show_all();
+				handle_show_all($nsock, $db, \%cache, $rest);
 			} elsif ($cmd eq "verbosity") {
-				m_verbosity();
+				handle_verbosity($nsock, $rest);
 			} else {
-				print $nsock "ERROR nonexistent command name.\r\n";
+				print $nsock "ERROR\r\n";
 			}
 		}
+
+		undef $db; untie %cache;
+		undef $cas_db; untie %cas_store;
+		undef $env;
 		close($nsock);
-		exit 0;
+		POSIX::_exit(0);
 	}
 
 	close($nsock);
