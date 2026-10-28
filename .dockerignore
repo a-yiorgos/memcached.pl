@@ -1,0 +1,13 @@
+.git
+.gitignore
+Dockerfile
+memcache.db*
+__db.*
+local/
+perl5/
+.cpan/
+.cpanm/
+/tmp/
+*.tmp
+*.log
+.DS_Store
