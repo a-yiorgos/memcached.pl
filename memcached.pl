@@ -1,15 +1,18 @@
 #!/usr/bin/perl
 
-# An (incomplete) implementation of the memcached text protocol
-# http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt
+# An implementation of the memcached text protocol
+# (http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt)
 # in Perl with persistence using BerkeleyDB.
 #
 # Useful for debugging and / or testing purposes, not for production.
 
+use strict;
+use warnings;
+
 use BerkeleyDB;
 use IO::Socket;
 use FreezeThaw qw(freeze thaw);
-use strict;
+use POSIX qw(:sys_wait_h);
 
 # Global variables.
 our (
@@ -24,12 +27,9 @@ our (
 	@line
 );
 
-# Signal handler for forked children. It may need to improve as documented
-# in perlipc.
+# Signal handler for forked children.
 sub REAPER {
-	my $waitpid;
-
-	$waitpid = wait();
+	while (waitpid(-1, WNOHANG) > 0) {}
 	$SIG{CHLD} = \&REAPER;
 }
 
@@ -39,20 +39,46 @@ sub set_casunique {
 
 	print TO_CHILD "get\n";
 	$casunique = <FROM_CHILD>;
-	chomp($casunique);
+	if (defined $casunique) {
+		chomp($casunique);
+	} else {
+		$casunique = 1;
+	}
 
-	return($casunique);
+	return $casunique;
+}
+
+# Read exact payload bytes from socket.
+sub read_bytes {
+	my ($bytes) = @_;
+	my $data = '';
+	my $read_len = 0;
+
+	while ($read_len < $bytes) {
+		my $buffer;
+		my $n = read($nsock, $buffer, $bytes - $read_len);
+		if (!defined $n || $n == 0) {
+			return undef; # Socket closed or error
+		}
+		$data .= $buffer;
+		$read_len += $n;
+	}
+
+	# Read trailing \r\n
+	my $crlf = '';
+	read($nsock, $crlf, 2);
+
+	return $data;
 }
 
 # set a key value.
 sub m_set {
 	my $noreply;
-	my $len;
+	my $len = @line;
 	my $lock;
 	my $key;
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -69,9 +95,16 @@ sub m_set {
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chop($val); chop($val);
+	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	$val = read_bytes($bytes);
+	if (!defined $val) {
+		print $nsock "CLIENT_ERROR bad data chunk\r\n";
+		return;
+	}
 
 	# Is $exptime < $month?
 	if (($exptime != 0) and ($exptime < $month)) {
@@ -92,13 +125,12 @@ sub m_set {
 # check and set a key value.
 sub m_cas {
 	my $noreply;
-	my $len;
+	my $len = @line;
 	my $lock;
 	my $key;
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
 	if (($len == 5) or ($len == 6)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -116,9 +148,16 @@ sub m_cas {
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chop($val); chop($val);
+	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	$val = read_bytes($bytes);
+	if (!defined $val) {
+		print $nsock "CLIENT_ERROR bad data chunk\r\n";
+		return;
+	}
 
 	# Check whether the key has actually expired first
 	if (defined($cache{$key})) {
@@ -159,12 +198,11 @@ sub m_cas {
 # get a key value.
 sub m_get {
 	my $mode = shift(@_);
-	my $len;
+	my $len = @line;
 	my $lock;
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
 	if ($len == 0) {
 		print $nsock "ERROR\r\n";
 		return;
@@ -201,13 +239,12 @@ sub m_get {
 sub m_add {
 	my $noreply;
 	my $mode = shift(@_);
-	my $len;
+	my $len = @line;
 	my $lock;
 	my $key;
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -224,9 +261,16 @@ sub m_add {
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chop($val); chop($val);
+	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	$val = read_bytes($bytes);
+	if (!defined $val) {
+		print $nsock "CLIENT_ERROR bad data chunk\r\n";
+		return;
+	}
 
 	# Check whether the key has actually expired first.
 	if (defined($cache{$key})) {
@@ -267,11 +311,10 @@ sub m_add {
 # delete a key if it exists.
 sub m_delete {
 	my $noreply;
-	my $len;
+	my $len = @line;
 	my $lock;
 	my $key;
 
-	$len = @line;
 	if (($len == 1) or ($len == 2)) {
 		$key = shift(@line);
 		if ($len == 2) {
@@ -343,14 +386,13 @@ sub m_show_all {
 # append / prepend data to key value
 sub m_append {
 	my $noreply;
-	my $len;
+	my $len = @line;
 	my $mode = shift(@_);
 	my $lock;
 	my $key;
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -367,9 +409,16 @@ sub m_append {
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chop($val); chop($val);
+	if (!defined($bytes) || $bytes !~ /^\d+$/) {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	$val = read_bytes($bytes);
+	if (!defined $val) {
+		print $nsock "CLIENT_ERROR bad data chunk\r\n";
+		return;
+	}
 
 	if (defined($cache{$key})) {
 		# Check whether the key has actually expired first
@@ -401,7 +450,7 @@ sub m_append {
 		return;
 	}
 
-	$data = freeze $flags, $exptime, length($val), $casunique, $val;
+	$data = freeze $oflags, $oexptime, length($val), $casunique, $val;
 	$lock = $db->cds_lock();
 	$cache{$key} = $data;
 	$lock->cds_unlock();
@@ -414,9 +463,11 @@ sub m_append {
 sub m_verbosity {
 	my $noreply;
 
-	$noreply = $line[$#line];
-	if ($noreply ne "noreply") {
-		undef($noreply);
+	if (@line) {
+		$noreply = $line[$#line];
+		if ($noreply ne "noreply") {
+			undef($noreply);
+		}
 	}
 
 	print $nsock "OK\r\n" unless defined($noreply);
@@ -427,14 +478,13 @@ sub m_verbosity {
 # increment / decrement the numeric value of a key
 sub m_incr {
 	my $noreply;
-	my $len;
+	my $len = @line;
 	my $num;
 	my $mode = shift(@_);
 	my $lock;
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
 	if (($len == 2) or ($len == 3)) {
 		$key = shift(@line);
 		$num = shift(@line);
@@ -486,7 +536,7 @@ sub m_incr {
 
 	$casunique = set_casunique();
 	$lock = $db->cds_lock();
-	$cache{$key} = freeze $flags, $exptime, $bytes, $casunique, $val;
+	$cache{$key} = freeze $flags, $exptime, length($val), $casunique, $val;
 	$lock->cds_unlock();
 	print $nsock $val, "\r\n";
 
@@ -496,81 +546,89 @@ sub m_incr {
 # Set the signal handler.
 $SIG{CHLD} = \&REAPER;
 
-# One month in seconds.
-$month = 68 * 60 * 24 * 30;
-
-# We have to do some command line options processing here in the future.
+# One month in seconds (30 days * 24 hours * 60 mins * 60 secs)
+$month = 60 * 60 * 24 * 30;
 
 # Create a database environment
 $env = new BerkeleyDB::Env (
 	-Home => '/tmp',
-	-Flags  => DB_CREATE| DB_INIT_CDB | DB_INIT_MPOOL)
+	-Flags  => DB_CREATE | DB_INIT_CDB | DB_INIT_MPOOL)
 	or die "cannot open environment: $BerkeleyDB::Error\n";
 
-# Open the data store. new or tie?
+# Open the data store.
 $db = tie %cache, 'BerkeleyDB::Hash', 
 	-Filename => 'memcache.db',
 	-Flags => DB_CREATE ,
 	-Env => $env
 	or die "cannot open database: $BerkeleyDB::Error\n";
 
-# Create a process that produces casunique values.
+# Create pipes for CAS value production child process.
 pipe(FROM_PARENT, TO_CHILD) or die "cannot pipe: $!\n";
 pipe(FROM_CHILD, TO_PARENT) or die "cannot pipe: $!\n";
-TO_CHILD->autoflush();
-TO_PARENT->autoflush();
+TO_CHILD->autoflush(1);
+TO_PARENT->autoflush(1);
 
 $pid = fork();
-die "Cannnot fork: $!" unless defined($pid);
+die "Cannot fork: $!" unless defined($pid);
 if ($pid == 0) {
-	# I am a child and my job is to produce unique CAS numbers. I do this
-	# by incrementing a counter. Since we have persistence, then
-	# $casunique is persistent too, so we have to iterate among stored 
-	# keys to identify the largest value.
+	# Child process: generates unique CAS numbers.
+	close(FROM_CHILD);
+	close(TO_CHILD);
+
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $ocasunique, $val);
-	my $casunique = 1;
+	my $cas_counter = 1;
 
 	foreach $key (keys %cache) {
-		($flags, $exptime, $bytes, $ocasunique, $val) = thaw $cache{$key};
-		$casunique = $ocasunique unless ($casunique >= $ocasunique);
+		if (defined $cache{$key}) {
+			($flags, $exptime, $bytes, $ocasunique, $val) = thaw $cache{$key};
+			if (defined $ocasunique && $ocasunique > $cas_counter) {
+				$cas_counter = $ocasunique;
+			}
+		}
 	}
-	print "cas unique value starts from $casunique\n";
 
 	while (<FROM_PARENT>) {
-		$casunique++;
-		print TO_PARENT $casunique, "\n";
+		$cas_counter++;
+		print TO_PARENT $cas_counter, "\n";
 	}
+	exit 0;
 }
 
-# Create a listener.
+close(FROM_PARENT);
+close(TO_PARENT);
+
+# Create a listener socket.
 $sock = new IO::Socket::INET (
 	LocalHost => '127.0.0.1:11311',
 	Proto => 'tcp',
 	Listen => 10,
 	ReuseAddr => 1) or die "cannot open socket: $!\n";
 
-# So now we are ready to handle incoming connections.
+# Main connection acceptance loop
 while (1) {
-	# Accept a connection.
 	$nsock = $sock->accept();
+	next unless defined $nsock;
 
-	# Fork a child.
 	$pid = fork();
-	die "Cannnot fork: $!" unless defined($pid);
+	die "Cannot fork: $!" unless defined($pid);
 	if ($pid == 0) {
-		# I am a child and I am waiting for input.
-		# Note: For the moment we are not checking whether 
-		# commands sent by clients are terminated with \r\n.
-		while (<$nsock>) {
-			print;
-			@line = split(/\s+/);
+		# Worker child process
+		close($sock);
+
+		while (my $raw_line = <$nsock>) {
+			$raw_line =~ s/[\r\n]+$//;
+			next if $raw_line eq '';
+
+			@line = split(/\s+/, $raw_line);
 			$cmd = shift(@line);
+			next unless defined $cmd;
+
 			if ($cmd eq "quit") {
 				close($nsock);
 				exit 0;
 			} elsif ($cmd eq "version") {
-				print $nsock "VERSION memcached.pl v0.0\r\n";
+				print $nsock "VERSION memcached.pl v0.1\r\n";
 			} elsif ($cmd eq "set") {
 				m_set();
 			} elsif ($cmd eq "get") {
@@ -605,12 +663,13 @@ while (1) {
 				print $nsock "ERROR nonexistent command name.\r\n";
 			}
 		}
+		close($nsock);
+		exit 0;
 	}
 
-	# I am the parent.
+	close($nsock);
 }
 
-# I never reach here.
 close($sock);
 
 __END__

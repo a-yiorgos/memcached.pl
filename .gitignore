@@ -1,0 +1,30 @@
+# BerkeleyDB data and environment files
+memcache.db*
+__db.*
+
+# Perl build / distribution artifacts
+Makefile
+Makefile.old
+Build
+_build/
+blib/
+inc/
+pm_to_blib
+MANIFEST.bak
+MANIFEST.SKIP
+*.bak
+*.o
+*.so
+*.bs
+
+# CPAN local directory and cache
+local/
+perl5/
+.cpan/
+.cpanm/
+
+# Temp files and OS junk
+/tmp/
+*.tmp
+*.log
+.DS_Store
