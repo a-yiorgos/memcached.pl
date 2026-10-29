@@ -14,6 +14,7 @@ use POSIX qw(:sys_wait_h _exit);
 use Getopt::Long;
 use File::Path qw(make_path);
 use Math::BigInt;
+use Errno qw(EINTR);
 
 # Options with defaults
 my $listen_addr = '127.0.0.1';
@@ -28,13 +29,14 @@ GetOptions(
 
 make_path($dbdir) unless -d $dbdir;
 
-# Signal handler for forked children.
-sub REAPER {
-	while (waitpid(-1, WNOHANG) > 0) {}
-	$SIG{CHLD} = \&REAPER;
-}
+# Ignore SIGPIPE and automatically reap child processes
+$SIG{PIPE} = 'IGNORE';
+$SIG{CHLD} = 'IGNORE';
 
-$SIG{CHLD} = \&REAPER;
+$SIG{INT}  = sub { POSIX::_exit(0); };
+$SIG{TERM} = sub { POSIX::_exit(0); };
+$SIG{HUP}  = sub { POSIX::_exit(0); };
+$SIG{QUIT} = sub { POSIX::_exit(0); };
 
 # One month in seconds (30 days * 24 hours * 60 mins * 60 secs)
 my $month = 60 * 60 * 24 * 30;
@@ -185,8 +187,13 @@ sub handle_storage {
 	}
 
 	my $bytes_to_read;
-	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
-		$bytes_to_read = $tokens[3];
+	my $negative_bytes;
+	if (@tokens >= 4) {
+		if (is_valid_bytes($tokens[-1])) {
+			$bytes_to_read = $tokens[-1];
+		} elsif ($tokens[-1] =~ /^-\d+$/) {
+			$negative_bytes = 1;
+		}
 	}
 
 	my $cmd_valid = (@tokens == 4);
@@ -194,6 +201,12 @@ sub handle_storage {
 	if ($cmd_valid) {
 		($key, $flags, $exptime, $bytes) = @tokens;
 		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes));
+	}
+
+	if ($negative_bytes) {
+		my $discard = <$nsock>;
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
 	}
 
 	if (defined $bytes_to_read) {
@@ -212,6 +225,7 @@ sub handle_storage {
 		my $real_exptime = parse_exptime($exptime);
 
 		my $lock = $db->cds_lock();
+		my $casunique = next_cas($cas_store_ref);
 		if (defined $cache_ref->{$key}) {
 			my ($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
 			if ($oexptime != 0 && $oexptime < time()) {
@@ -230,7 +244,6 @@ sub handle_storage {
 			return;
 		}
 
-		my $casunique = next_cas($cas_store_ref);
 		my $data = freeze $flags, $real_exptime, $bytes, $casunique, $val;
 		$cache_ref->{$key} = $data;
 		undef $lock;
@@ -251,8 +264,19 @@ sub handle_cas {
 	}
 
 	my $bytes_to_read;
-	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
-		$bytes_to_read = $tokens[3];
+	my $negative_bytes;
+	if (@tokens >= 5) {
+		if (is_valid_bytes($tokens[-2])) {
+			$bytes_to_read = $tokens[-2];
+		} elsif ($tokens[-2] =~ /^-\d+$/) {
+			$negative_bytes = 1;
+		}
+	} elsif (@tokens >= 4) {
+		if (is_valid_bytes($tokens[-1])) {
+			$bytes_to_read = $tokens[-1];
+		} elsif ($tokens[-1] =~ /^-\d+$/) {
+			$negative_bytes = 1;
+		}
 	}
 
 	my $cmd_valid = (@tokens == 5);
@@ -260,6 +284,12 @@ sub handle_cas {
 	if ($cmd_valid) {
 		($key, $flags, $exptime, $bytes, $casunique) = @tokens;
 		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes) && is_valid_uint64($casunique));
+	}
+
+	if ($negative_bytes) {
+		my $discard = <$nsock>;
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
 	}
 
 	if (defined $bytes_to_read) {
@@ -278,6 +308,7 @@ sub handle_cas {
 		my $real_exptime = parse_exptime($exptime);
 
 		my $lock = $db->cds_lock();
+		my $new_cas = next_cas($cas_store_ref);
 		my ($oflags, $oexptime, $obytes, $ocas, $oval);
 		if (defined $cache_ref->{$key}) {
 			($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
@@ -298,7 +329,6 @@ sub handle_cas {
 			return;
 		}
 
-		my $new_cas = next_cas($cas_store_ref);
 		my $data = freeze $flags, $real_exptime, $bytes, $new_cas, $val;
 		$cache_ref->{$key} = $data;
 		undef $lock;
@@ -319,8 +349,13 @@ sub handle_append_prepend {
 	}
 
 	my $bytes_to_read;
-	if (@tokens >= 4 && is_valid_bytes($tokens[3])) {
-		$bytes_to_read = $tokens[3];
+	my $negative_bytes;
+	if (@tokens >= 4) {
+		if (is_valid_bytes($tokens[-1])) {
+			$bytes_to_read = $tokens[-1];
+		} elsif ($tokens[-1] =~ /^-\d+$/) {
+			$negative_bytes = 1;
+		}
 	}
 
 	my $cmd_valid = (@tokens == 4);
@@ -328,6 +363,12 @@ sub handle_append_prepend {
 	if ($cmd_valid) {
 		($key, $flags, $exptime, $bytes) = @tokens;
 		$cmd_valid = (is_valid_key($key) && is_valid_flags($flags) && is_valid_exptime($exptime) && is_valid_bytes($bytes));
+	}
+
+	if ($negative_bytes) {
+		my $discard = <$nsock>;
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
 	}
 
 	if (defined $bytes_to_read) {
@@ -344,6 +385,7 @@ sub handle_append_prepend {
 		}
 
 		my $lock = $db->cds_lock();
+		my $new_cas = next_cas($cas_store_ref);
 		my ($oflags, $oexptime, $obytes, $ocas, $oval);
 		if (defined $cache_ref->{$key}) {
 			($oflags, $oexptime, $obytes, $ocas, $oval) = thaw $cache_ref->{$key};
@@ -359,7 +401,6 @@ sub handle_append_prepend {
 		}
 
 		my $new_val = ($mode eq "append") ? $oval . $val : $val . $oval;
-		my $new_cas = next_cas($cas_store_ref);
 		my $data = freeze $oflags, $oexptime, length($new_val), $new_cas, $new_val;
 		$cache_ref->{$key} = $data;
 		undef $lock;
@@ -469,6 +510,7 @@ sub handle_incr_decr {
 	}
 
 	my $lock = $db->cds_lock();
+	my $new_cas = next_cas($cas_store_ref);
 	my ($flags, $exptime, $bytes, $cas, $val);
 	if (defined $cache_ref->{$key}) {
 		($flags, $exptime, $bytes, $cas, $val) = thaw $cache_ref->{$key};
@@ -489,22 +531,40 @@ sub handle_incr_decr {
 		return;
 	}
 
-	my $b_val   = Math::BigInt->new($val);
-	my $b_delta = Math::BigInt->new($delta);
-	my $mod     = Math::BigInt->new("18446744073709551616");
-
-	if ($mode eq "incr") {
-		$b_val->badd($b_delta);
-		$b_val->bmod($mod);
-	} else {
-		$b_val->bsub($b_delta);
-		if ($b_val->is_neg()) {
-			$b_val = Math::BigInt->new(0);
+	my $new_val;
+	if (length($val) < 19 && length($delta) < 19) {
+		if ($mode eq "incr") {
+			my $nv = $val + $delta;
+			if ($nv > 18446744073709551615) {
+				my $b_val   = Math::BigInt->new($val);
+				my $b_delta = Math::BigInt->new($delta);
+				my $mod     = Math::BigInt->new("18446744073709551616");
+				$b_val->badd($b_delta);
+				$b_val->bmod($mod);
+				$new_val = $b_val->bstr();
+			} else {
+				$new_val = "$nv";
+			}
+		} else {
+			my $nv = $val - $delta;
+			$new_val = ($nv < 0) ? "0" : "$nv";
 		}
+	} else {
+		my $b_val   = Math::BigInt->new($val);
+		my $b_delta = Math::BigInt->new($delta);
+		my $mod     = Math::BigInt->new("18446744073709551616");
+		if ($mode eq "incr") {
+			$b_val->badd($b_delta);
+			$b_val->bmod($mod);
+		} else {
+			$b_val->bsub($b_delta);
+			if ($b_val->is_neg()) {
+				$b_val = Math::BigInt->new(0);
+			}
+		}
+		$new_val = $b_val->bstr();
 	}
 
-	my $new_val = $b_val->bstr();
-	my $new_cas = next_cas($cas_store_ref);
 	$cache_ref->{$key} = freeze $flags, $exptime, length($new_val), $new_cas, $new_val;
 	undef $lock;
 
@@ -583,7 +643,12 @@ my $sock = new IO::Socket::INET(
 
 # Main connection acceptance loop
 while (1) {
-	my $nsock = $sock->accept();
+	my $nsock;
+	do {
+		$! = 0;
+		$nsock = $sock->accept();
+	} while (!defined $nsock && $!{EINTR});
+
 	next unless defined $nsock;
 
 	my $pid = fork();
@@ -591,7 +656,7 @@ while (1) {
 
 	if ($pid == 0) {
 		# Worker child process
-		close($sock);
+		CORE::close($sock);
 		$nsock->autoflush(1);
 
 		# Open worker's own BerkeleyDB environment and databases
@@ -621,10 +686,7 @@ while (1) {
 			$trimmed =~ s/\s+$//;
 			if ($trimmed eq '') {
 				if (!defined $raw_line) {
-					undef $db; untie %cache;
-					undef $cas_db; untie %cas_store;
-					undef $env;
-					close($nsock);
+					CORE::close($nsock);
 					POSIX::_exit(0);
 				}
 				next;
@@ -685,11 +747,12 @@ while (1) {
 		undef $db; untie %cache;
 		undef $cas_db; untie %cas_store;
 		undef $env;
-		close($nsock);
+		CORE::close($nsock);
 		POSIX::_exit(0);
 	}
 
-	close($nsock);
+	CORE::close($nsock);
 }
 
 close($sock);
+warn "Parent memcached.pl exited main loop!\n";

@@ -1,5 +1,7 @@
 # BerkeleyDB data and environment files
+data/
 memcache.db*
+cas.db*
 __db.*
 
 # Perl build / distribution artifacts
