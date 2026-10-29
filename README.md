@@ -15,16 +15,26 @@ Originally created for debugging/testing purposes by Yiorgos Adamopoulos (2012).
 
 ---
 
+## Options
+
+- `--listen` (default `127.0.0.1`)
+- `--port` (default `11311`)
+- `--dbdir` (default `./data`; holds `memcache.db`, `cas.db` and the `__db.*` environment files)
+
+---
+
 ## Docker Quickstart
 
-You can build and run `memcached.pl` using Docker in rootless mode:
+The image runs as non-root UID 10001, data persists in the `/data` volume, and the build runs the test suite.
 
 ```bash
 # Build the Docker image
 docker build -t memcached-perl .
 
 # Run the container with a persistent volume
-docker run -d -p 11311:11311 -v mcdata:/data --name memcached-perl-app memcached-perl
+docker run -d --name memcached-perl -p 11311:11311 \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  -v mcdata:/data memcached-perl
 ```
 
 Test the running container using `nc` (netcat) or `telnet`:
@@ -81,4 +91,10 @@ Run the test suite using `prove`:
 
 ```bash
 prove -v t/
+```
+
+To run the container tests:
+
+```bash
+DOCKER_TESTS=1 prove -v t/09_container.t
 ```
