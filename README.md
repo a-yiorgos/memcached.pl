@@ -17,14 +17,14 @@ Originally created for debugging/testing purposes by Yiorgos Adamopoulos (2012).
 
 ## Docker Quickstart
 
-You can build and run `memcached.pl` using the official `perl:stable` Docker image.
+You can build and run `memcached.pl` using Docker in rootless mode:
 
 ```bash
 # Build the Docker image
 docker build -t memcached-perl .
 
-# Run the container
-docker run -d -p 11311:11311 --name memcached-perl-app memcached-perl
+# Run the container with a persistent volume
+docker run -d -p 11311:11311 -v mcdata:/data --name memcached-perl-app memcached-perl
 ```
 
 Test the running container using `nc` (netcat) or `telnet`:
@@ -33,6 +33,8 @@ Test the running container using `nc` (netcat) or `telnet`:
 nc 127.0.0.1 11311
 set mykey 0 0 5
 hello
+STORED
+get mykey
 VALUE mykey 0 5
 hello
 END
@@ -75,8 +77,8 @@ Below is the status of command implementation according to the official `protoco
 
 ## Running Tests
 
-Run the test suite using `perl`:
+Run the test suite using `prove`:
 
 ```bash
-perl -I/path/to/perl5 t/01_protocol.t
+prove -v t/
 ```

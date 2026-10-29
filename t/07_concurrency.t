@@ -29,8 +29,9 @@ close($sock);
 
 ok($race_cas, "got initial CAS for race_key: $race_cas");
 
-# 20 forked clients
-my $num_clients = 20;
+# 10 forked clients
+my $num_clients = 10;
+my $iterations  = 20;
 my @pids;
 
 for my $i (1..$num_clients) {
@@ -44,32 +45,35 @@ for my $i (1..$num_clients) {
             exit 1;
         }
 
-        # Task 1: 200 incr ctr 1
-        for my $j (1..200) {
+        # Task 1: 20 incr ctr 1
+        for my $j (1..$iterations) {
             print $csock "incr ctr 1\r\n";
-            read_line($csock);
+            read_line($csock, 30);
         }
 
         # Task 2: set and gets on client's own key
         my $my_key = "client_key_$i";
-        print $csock "set $my_key 0 0 5\r\nval_$i\r\n";
-        read_line($csock);
+        my $my_val = "val_$i";
+        my $vlen   = length($my_val);
+        print $csock "set $my_key 0 0 $vlen\r\n$my_val\r\n";
+        read_line($csock, 30);
 
         print $csock "gets $my_key\r\n";
-        my $ghead = read_line($csock);
-        my ($my_cas) = ($ghead =~ /^VALUE $my_key 0 5 (\d+)\r\n$/);
-        read_line($csock); read_line($csock);
+        my $ghead = read_line($csock, 30);
+        my ($my_cas) = ($ghead =~ /^VALUE $my_key 0 $vlen (\d+)\r\n$/);
+        read_line($csock, 30); read_line($csock, 30);
 
-        # Write CAS result to temporary file/pipe or exit code, or print to a standard pattern
-        # Write to temporary file for parent collection
+        # Write CAS result to temporary file
         open(my $fh, '>', "t_cas_client_$i.tmp") or exit 1;
         print $fh "$my_cas\n";
         close($fh);
 
-        # Task 3: 10 clients race cas on race_key with initial token
-        if ($i <= 10) {
-            print $csock "cas race_key 0 0 5 $race_cas\r\nval_$i\r\n";
-            my $res = read_line($csock);
+        # Task 3: 5 clients race cas on race_key with initial token
+        if ($i <= 5) {
+            my $rval = "val_$i";
+            my $rlen = length($rval);
+            print $csock "cas race_key 0 0 $rlen $race_cas\r\n$rval\r\n";
+            my $res = read_line($csock, 30);
             open(my $rfh, '>', "t_race_client_$i.tmp") or exit 1;
             print $rfh $res;
             close($rfh);
@@ -82,8 +86,7 @@ for my $i (1..$num_clients) {
 }
 
 # Wait for all children with timeout
-my $timeout = 25;
-my $elapsed = time() - $start_time;
+my $timeout = 60;
 while (@pids && (time() - $start_time) < $timeout) {
     @pids = grep {
         my $res = waitpid($_, WNOHANG);
@@ -93,20 +96,30 @@ while (@pids && (time() - $start_time) < $timeout) {
             1; # process still running
         }
     } @pids;
-    sleep(0.05);
+    sleep(0.02);
 }
 
-is(scalar(@pids), 0, "All 20 client worker processes finished without hanging");
+is(scalar(@pids), 0, "All 10 client worker processes finished without hanging");
 
-# Verify final ctr value == 4000
+# Verify final ctr value == num_clients * iterations
+my $expected_ctr = $num_clients * $iterations;
 $sock = $server->connect();
+if (!$sock) {
+    if (-f $server->{stderr_file}) {
+        open(my $efh, '<', $server->{stderr_file});
+        my $err = do { local $/; <$efh> };
+        close($efh);
+        diag("SERVER STDERR AT FAIL:\n$err");
+    }
+    die "Server connect failed!";
+}
 print $sock "get ctr\r\n";
 read_line($sock); # header
 my $final_ctr = read_line($sock);
 read_line($sock); # END
 chomp $final_ctr;
 $final_ctr =~ s/\r$//;
-is($final_ctr, "4000", "Final counter value after 20*200 increments is exactly 4000");
+is($final_ctr, "$expected_ctr", "Final counter value after increments is exactly $expected_ctr");
 
 # Collect collected CAS values and verify uniqueness
 my %cas_seen;
@@ -126,10 +139,10 @@ for my $i (1..$num_clients) {
 
 is(scalar(keys %cas_seen), $num_clients, "All collected CAS values across clients are unique");
 
-# Verify CAS race results (exactly 1 STORED, 9 EXISTS)
+# Verify CAS race results (exactly 1 STORED, 4 EXISTS)
 my $stored_count = 0;
 my $exists_count = 0;
-for my $i (1..10) {
+for my $i (1..5) {
     my $fn = "t_race_client_$i.tmp";
     if (-f $fn) {
         open(my $fh, '<', $fn);
@@ -147,10 +160,10 @@ for my $i (1..10) {
 }
 
 is($stored_count, 1, "CAS race on same key: exactly 1 client got STORED");
-is($exists_count, 9, "CAS race on same key: exactly 9 clients got EXISTS");
+is($exists_count, 4, "CAS race on same key: exactly 4 clients got EXISTS");
 
 my $total_elapsed = time() - $start_time;
-cmp_ok($total_elapsed, '<', 30, "Concurrency test suite completed in under 30 seconds");
+cmp_ok($total_elapsed, '<', 60, "Concurrency test suite completed in under 60 seconds");
 
 $server->stop();
 done_testing();

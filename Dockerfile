@@ -12,6 +12,13 @@ WORKDIR /usr/src/app
 
 COPY . /usr/src/app
 
+# Create data directory with proper ownership for rootless execution
+RUN mkdir -p /data && chown -R 10001:10001 /data /usr/src/app
+
+VOLUME /data
+
+USER 10001:10001
+
 EXPOSE 11311
 
-CMD ["perl", "memcached.pl"]
+CMD ["perl", "memcached.pl", "--listen=0.0.0.0", "--dbdir=/data"]

@@ -22,10 +22,13 @@ our @EXPORT_OK = qw(
 );
 
 my @INSTANCES;
+my $master_pid = $$;
 
 END {
-    for my $inst (@INSTANCES) {
-        $inst->stop();
+    if ($$ == $master_pid) {
+        for my $inst (@INSTANCES) {
+            $inst->stop();
+        }
     }
 }
 
@@ -114,6 +117,7 @@ sub dbdir { $_[0]->{dbdir} }
 sub connect {
     my ($self) = @_;
     my $sock;
+    my $err = '';
     for my $attempt (1..20) {
         $sock = IO::Socket::INET->new(
             PeerAddr => '127.0.0.1',
@@ -122,10 +126,13 @@ sub connect {
             Timeout  => 5,
         );
         last if $sock;
+        $err = $!;
         usleep(50000);
     }
     if ($sock) {
         $sock->autoflush(1);
+    } else {
+        warn "TestServer::connect failed to port $self->{port}: $err\n";
     }
     return $sock;
 }

@@ -1,7 +1,9 @@
 .git
 .gitignore
 Dockerfile
+data/
 memcache.db*
+cas.db*
 __db.*
 local/
 perl5/
