@@ -1,24 +1,24 @@
 FROM perl:stable
 
-# Install Berkeley DB system headers and libraries
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libdb-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install required Perl modules from CPAN
-RUN cpanm --notest BerkeleyDB FreezeThaw
+    rm -rf /var/lib/apt/lists/* && \
+    cpanm --notest BerkeleyDB FreezeThaw && \
+    rm -rf /root/.cpanm
 
 WORKDIR /usr/src/app
-
-COPY . /usr/src/app
-
-# Create data directory with proper ownership for rootless execution
-RUN mkdir -p /data && chown -R 10001:10001 /data /usr/src/app
-
-VOLUME /data
+COPY . .
+RUN chown -R root:root /usr/src/app && \
+    chmod -R u=rwX,go=rX /usr/src/app && \
+    chmod 0755 memcached.pl && \
+    mkdir -p /data && chown 10001:10001 /data && chmod 0700 /data
 
 USER 10001:10001
 
-EXPOSE 11311
+RUN cp -r /usr/src/app /tmp/build-test && \
+    cd /tmp/build-test && prove t/ && \
+    rm -rf /tmp/build-test
 
-CMD ["perl", "memcached.pl", "--listen=0.0.0.0", "--dbdir=/data"]
+VOLUME /data
+EXPOSE 11311
+CMD ["perl", "memcached.pl", "--listen", "0.0.0.0", "--port", "11311", "--dbdir", "/data"]
