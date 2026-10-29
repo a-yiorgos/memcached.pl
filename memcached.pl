@@ -15,6 +15,7 @@ use Getopt::Long;
 use File::Path qw(make_path);
 use Math::BigInt;
 use Errno qw(EINTR);
+use Fcntl qw(:flock);
 
 # Options with defaults
 my $listen_addr = '127.0.0.1';
@@ -29,13 +30,31 @@ GetOptions(
 
 make_path($dbdir) unless -d $dbdir;
 
+# Single instance lock and stale environment cleanup before opening BerkeleyDB
+open(my $instance_lock_fh, '>>', "$dbdir/.lock") or die "cannot open lock file $dbdir/.lock: $!\n";
+if (!flock($instance_lock_fh, LOCK_EX | LOCK_NB)) {
+	print STDERR "another instance is using $dbdir\n";
+	exit 1;
+}
+
+unlink glob("$dbdir/__db.[0-9]*");
+
+# Parent process group setup
+POSIX::setpgid(0, 0);
+
 # Ignore SIGPIPE and automatically reap child processes
 $SIG{PIPE} = 'IGNORE';
 $SIG{CHLD} = 'IGNORE';
 
-$SIG{INT}  = sub { POSIX::_exit(0); };
-$SIG{TERM} = sub { POSIX::_exit(0); };
-$SIG{HUP}  = sub { POSIX::_exit(0); };
+my $shutdown_handler = sub {
+	$SIG{TERM} = 'IGNORE';
+	kill('TERM', -$$);
+	POSIX::_exit(0);
+};
+
+$SIG{INT}  = $shutdown_handler;
+$SIG{TERM} = $shutdown_handler;
+$SIG{HUP}  = $shutdown_handler;
 $SIG{QUIT} = sub { POSIX::_exit(0); };
 
 # One month in seconds (30 days * 24 hours * 60 mins * 60 secs)
@@ -426,6 +445,7 @@ sub handle_get {
 		}
 	}
 
+	my $res = '';
 	my $lock = $db->cds_lock();
 	while (defined(my $key = shift(@keys))) {
 		if (defined $cache_ref->{$key}) {
@@ -434,16 +454,17 @@ sub handle_get {
 				delete $cache_ref->{$key};
 			} else {
 				if ($mode eq "get") {
-					print $nsock "VALUE $key $flags $bytes\r\n";
+					$res .= "VALUE $key $flags $bytes\r\n";
 				} elsif ($mode eq "gets") {
-					print $nsock "VALUE $key $flags $bytes $casunique\r\n";
+					$res .= "VALUE $key $flags $bytes $casunique\r\n";
 				}
-				print $nsock $val, "\r\n";
+				$res .= $val . "\r\n";
 			}
 		}
 	}
 	undef $lock;
-	print $nsock "END\r\n";
+	$res .= "END\r\n";
+	print $nsock $res;
 }
 
 sub handle_delete {
@@ -599,6 +620,7 @@ sub handle_show_all {
 		return;
 	}
 
+	my $res = '';
 	my $lock = $db->cds_lock();
 	foreach my $key (keys %$cache_ref) {
 		if (defined $cache_ref->{$key}) {
@@ -606,13 +628,14 @@ sub handle_show_all {
 			if ($exptime != 0 && $exptime < time()) {
 				delete $cache_ref->{$key};
 			} else {
-				print $nsock "VALUE $key $flags $bytes\r\n";
-				print $nsock $val, "\r\n";
+				$res .= "VALUE $key $flags $bytes\r\n";
+				$res .= $val . "\r\n";
 			}
 		}
 	}
 	undef $lock;
-	print $nsock "END\r\n";
+	$res .= "END\r\n";
+	print $nsock $res;
 }
 
 sub handle_verbosity {
@@ -658,6 +681,11 @@ while (1) {
 		# Worker child process
 		CORE::close($sock);
 		$nsock->autoflush(1);
+
+		$SIG{INT}  = sub { POSIX::_exit(0); };
+		$SIG{TERM} = sub { POSIX::_exit(0); };
+		$SIG{HUP}  = sub { POSIX::_exit(0); };
+		$SIG{QUIT} = sub { POSIX::_exit(0); };
 
 		# Open worker's own BerkeleyDB environment and databases
 		my (%cache, %cas_store);
