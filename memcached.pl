@@ -2,26 +2,33 @@
 
 # An (incomplete) implementation of the memcached text protocol
 # http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt
-# in Perl with persistence using BerkeleyDB.
+# in Perl with persistence using DB_File.
 #
 # Useful for debugging and / or testing purposes, not for production.
 
-use BerkeleyDB;
-use IO::Socket;
-use FreezeThaw qw(freeze thaw);
 use strict;
+use warnings;
+use DB_File;
+use IO::Socket;
+use Storable qw(freeze thaw);
+use POSIX qw(:sys_wait_h);
+use Fcntl qw(O_RDWR O_CREAT);
+use Getopt::Long;
 
 # Global variables.
 our (
 	$pid,
 	$month,
-	$env,
 	$db,
 	%cache,
 	$sock,
 	$nsock,
 	$cmd,
-	@line
+	@line,
+	$FROM_PARENT,
+	$TO_CHILD,
+	$FROM_CHILD,
+	$TO_PARENT
 );
 
 # Signal handler for forked children. It may need to improve as documented
@@ -37,11 +44,11 @@ sub REAPER {
 sub set_casunique {
 	my $casunique;
 
-	print TO_CHILD "get\n";
-	$casunique = <FROM_CHILD>;
+	print $TO_CHILD "get\n";
+	$casunique = <$FROM_CHILD>;
 	chomp($casunique);
 
-	return($casunique);
+	return $casunique;
 }
 
 # set a key value.
@@ -52,7 +59,7 @@ sub m_set {
 	my $key;
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -71,7 +78,7 @@ sub m_set {
 
 	# A better check for the value input is needed.
 	$val = <$nsock>;
-	chop($val); chop($val);
+	chomp $val;
 
 	# Is $exptime < $month?
 	if (($exptime != 0) and ($exptime < $month)) {
@@ -79,11 +86,11 @@ sub m_set {
 	}
 
 	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
+	$data = freeze [$flags, $exptime, $bytes, $casunique, $val];
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	$cache{$key} = $data;
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "STORED\r\n" unless(defined($noreply));
 
 	return;
@@ -98,7 +105,7 @@ sub m_cas {
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 5) or ($len == 6)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -118,15 +125,16 @@ sub m_cas {
 
 	# A better check for the value input is needed.
 	$val = <$nsock>;
-	chop($val); chop($val);
+	chomp $val;
 
 	# Check whether the key has actually expired first
 	if (defined($cache{$key})) {
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
+		my $ref = thaw $cache{$key};
+		($oflags, $oexptime, $obytes, $ocasunique, $oval) = @$ref;
 		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
+			$lock = $db->lock();
 			delete $cache{$key};
-			$lock->cds_unlock();
+			$lock->unlock();
 		}
 	}
 
@@ -146,11 +154,11 @@ sub m_cas {
 	}
 
 	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
+	$data = freeze [$flags, $exptime, $bytes, $casunique, $val];
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	$cache{$key} = $data;
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "STORED\r\n" unless(defined($noreply));
 
 	return;
@@ -164,7 +172,7 @@ sub m_get {
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
+	$len = scalar @line;
 	if ($len == 0) {
 		print $nsock "ERROR\r\n";
 		return;
@@ -174,11 +182,12 @@ sub m_get {
 	while ($key = shift(@line)) {
 		if (defined($cache{$key})) {
 			# Check whether the key has actually expired first
-			($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
+			my $ref = thaw $cache{$key};
+			($flags, $exptime, $bytes, $casunique, $val) = @$ref;
 			if (($exptime != 0) and ($exptime < time())) {
-				$lock = $db->cds_lock();
+				$lock = $db->lock();
 				delete $cache{$key};
-				$lock->cds_unlock();
+				$lock->unlock();
 			} else {
 				if ($mode eq "get") {
 					print $nsock "VALUE $key $flags $bytes\r\n";
@@ -207,7 +216,7 @@ sub m_add {
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -226,15 +235,16 @@ sub m_add {
 
 	# A better check for the value input is needed.
 	$val = <$nsock>;
-	chop($val); chop($val);
+	chomp $val;
 
 	# Check whether the key has actually expired first.
 	if (defined($cache{$key})) {
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
+		my $ref = thaw $cache{$key};
+		($oflags, $oexptime, $obytes, $ocasunique, $oval) = @$ref;
 		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
+			$lock = $db->lock();
 			delete $cache{$key};
-			$lock->cds_unlock();
+			$lock->unlock();
 		}
 	}
 
@@ -254,11 +264,11 @@ sub m_add {
 	}
 
 	$casunique = set_casunique();
-	$data = freeze $flags, $exptime, $bytes, $casunique, $val;
+	$data = freeze [$flags, $exptime, $bytes, $casunique, $val];
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	$cache{$key} = $data;
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "STORED\r\n" unless(defined($noreply));
 
 	return;
@@ -271,7 +281,7 @@ sub m_delete {
 	my $lock;
 	my $key;
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 1) or ($len == 2)) {
 		$key = shift(@line);
 		if ($len == 2) {
@@ -292,9 +302,9 @@ sub m_delete {
 		return;
 	}
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	delete $cache{$key};
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "DELETED\r\n" unless defined($noreply);
 
 	return;
@@ -305,11 +315,11 @@ sub m_flush_all {
 	my $lock;
 	my $key;
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	foreach $key (keys %cache) {
 		delete $cache{$key};
 	}
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "OK\r\n";
 
 	return;
@@ -321,11 +331,12 @@ sub m_show_all {
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $val);
 
-	$lock = $db->cds_lock();
+	$lock = $db->lock();
 	foreach $key (keys %cache) {
 		if (defined($cache{$key})) {
 			# Check whether the key has actually expired first
-			($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
+			my $ref = thaw $cache{$key};
+			($flags, $exptime, $bytes, $casunique, $val) = @$ref;
 			if (($exptime != 0) and ($exptime < time())) {
 				delete $cache{$key};
 			} else {
@@ -334,7 +345,7 @@ sub m_show_all {
 			}
 		}
 	}
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "END\r\n";
 
 	return;
@@ -350,7 +361,7 @@ sub m_append {
 	my ($data, $flags, $exptime, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 4) or ($len == 5)) {
 		$key = shift(@line);
 		$flags = shift(@line);
@@ -369,15 +380,16 @@ sub m_append {
 
 	# A better check for the value input is needed.
 	$val = <$nsock>;
-	chop($val); chop($val);
+	chomp $val;
 
 	if (defined($cache{$key})) {
 		# Check whether the key has actually expired first
-		($oflags, $oexptime, $obytes, $ocasunique, $oval) = thaw $cache{$key};
+		my $ref = thaw $cache{$key};
+		($oflags, $oexptime, $obytes, $ocasunique, $oval) = @$ref;
 		if (($oexptime != 0) and ($oexptime < time())) {
-			$lock = $db->cds_lock();
+			$lock = $db->lock();
 			delete $cache{$key};
-			$lock->cds_unlock();
+			$lock->unlock();
 			print $nsock "NOT_FOUND\r\n" unless defined($noreply);
 			return;
 		}
@@ -401,10 +413,10 @@ sub m_append {
 		return;
 	}
 
-	$data = freeze $flags, $exptime, length($val), $casunique, $val;
-	$lock = $db->cds_lock();
+	$data = freeze [$flags, $exptime, length($val), $casunique, $val];
+	$lock = $db->lock();
 	$cache{$key} = $data;
-	$lock->cds_unlock();
+	$lock->unlock();
 	print $nsock "STORED\r\n" unless defined($noreply);
 
 	return;
@@ -434,7 +446,7 @@ sub m_incr {
 	my $key;
 	my ($flags, $exptime, $bytes, $casunique, $val);
 
-	$len = @line;
+	$len = scalar @line;
 	if (($len == 2) or ($len == 3)) {
 		$key = shift(@line);
 		$num = shift(@line);
@@ -456,11 +468,12 @@ sub m_incr {
 
 	# Check whether the key has actually expired first
 	if (defined($cache{$key})) {
-		($flags, $exptime, $bytes, $casunique, $val) = thaw $cache{$key};
+		my $ref = thaw $cache{$key};
+		($flags, $exptime, $bytes, $casunique, $val) = @$ref;
 		if (($exptime != 0) and ($exptime < time())) {
-			$lock = $db->cds_lock();
+			$lock = $db->lock();
 			delete $cache{$key};
-			$lock->cds_unlock();
+			$lock->unlock();
 		}
 	}
 
@@ -485,9 +498,9 @@ sub m_incr {
 	}
 
 	$casunique = set_casunique();
-	$lock = $db->cds_lock();
-	$cache{$key} = freeze $flags, $exptime, $bytes, $casunique, $val;
-	$lock->cds_unlock();
+	$lock = $db->lock();
+	$cache{$key} = freeze [$flags, $exptime, $bytes, $casunique, $val];
+	$lock->unlock();
 	print $nsock $val, "\r\n";
 
 	return;
@@ -499,53 +512,58 @@ $SIG{CHLD} = \&REAPER;
 # One month in seconds.
 $month = 68 * 60 * 24 * 30;
 
-# We have to do some command line options processing here in the future.
+# Parse command line options
+my $listen = '127.0.0.1';
+my $port = 11311;
+my $dbdir = '.';
+GetOptions(
+	'listen=s' => \$listen,
+	'port=i'   => \$port,
+	'dbdir=s'  => \$dbdir,
+) or die "Invalid command line options\n";
 
-# Create a database environment
-$env = new BerkeleyDB::Env (
-	-Home => '/tmp',
-	-Flags  => DB_CREATE| DB_INIT_CDB | DB_INIT_MPOOL)
-	or die "cannot open environment: $BerkeleyDB::Error\n";
-
-# Open the data store. new or tie?
-$db = tie %cache, 'BerkeleyDB::Hash', 
-	-Filename => 'memcache.db',
-	-Flags => DB_CREATE ,
-	-Env => $env
-	or die "cannot open database: $BerkeleyDB::Error\n";
+# Open the data store using DB_File
+$db = tie %cache, 'DB_File', 
+	"$dbdir/memcache.db",
+	O_RDWR|O_CREAT,
+	0666
+	or die "cannot open database: $!\n";
 
 # Create a process that produces casunique values.
-pipe(FROM_PARENT, TO_CHILD) or die "cannot pipe: $!\n";
-pipe(FROM_CHILD, TO_PARENT) or die "cannot pipe: $!\n";
-TO_CHILD->autoflush();
-TO_PARENT->autoflush();
+pipe($FROM_PARENT, $TO_CHILD) or die "cannot pipe: $!\n";
+pipe($FROM_CHILD, $TO_PARENT) or die "cannot pipe: $!\n";
+$TO_CHILD->autoflush();
+$TO_PARENT->autoflush();
 
 $pid = fork();
-die "Cannnot fork: $!" unless defined($pid);
+die "Cannot fork: $!" unless defined($pid);
 if ($pid == 0) {
 	# I am a child and my job is to produce unique CAS numbers. I do this
 	# by incrementing a counter. Since we have persistence, then
 	# $casunique is persistent too, so we have to iterate among stored 
 	# keys to identify the largest value.
 	my $key;
-	my ($flags, $exptime, $bytes, $casunique, $ocasunique, $val);
-	my $casunique = 1;
+	my ($flags, $exptime, $bytes, $ocasunique, $oval);
+	my $local_casunique = 1;
 
 	foreach $key (keys %cache) {
-		($flags, $exptime, $bytes, $ocasunique, $val) = thaw $cache{$key};
-		$casunique = $ocasunique unless ($casunique >= $ocasunique);
+		my $ref = thaw $cache{$key};
+		($flags, $exptime, $bytes, $ocasunique, $oval) = @$ref;
+		$local_casunique = $ocasunique unless ($local_casunique >= $ocasunique);
 	}
-	print "cas unique value starts from $casunique\n";
+	print "cas unique value starts from $local_casunique\n";
 
-	while (<FROM_PARENT>) {
-		$casunique++;
-		print TO_PARENT $casunique, "\n";
+	while (<$FROM_PARENT>) {
+		$local_casunique++;
+		print $TO_PARENT $local_casunique, "\n";
 	}
+	
+	exit 0;
 }
 
 # Create a listener.
-$sock = new IO::Socket::INET (
-	LocalHost => '127.0.0.1:11311',
+$sock = IO::Socket::INET->new(
+	LocalHost => "$listen:$port",
 	Proto => 'tcp',
 	Listen => 10,
 	ReuseAddr => 1) or die "cannot open socket: $!\n";
@@ -557,14 +575,14 @@ while (1) {
 
 	# Fork a child.
 	$pid = fork();
-	die "Cannnot fork: $!" unless defined($pid);
+	die "Cannot fork: $!" unless defined($pid);
 	if ($pid == 0) {
 		# I am a child and I am waiting for input.
 		# Note: For the moment we are not checking whether 
 		# commands sent by clients are terminated with \r\n.
-		while (<$nsock>) {
-			print;
-			@line = split(/\s+/);
+		while (my $line = <$nsock>) {
+			print $line;
+			@line = split(/\s+/, $line);
 			$cmd = shift(@line);
 			if ($cmd eq "quit") {
 				close($nsock);
@@ -605,6 +623,8 @@ while (1) {
 				print $nsock "ERROR nonexistent command name.\r\n";
 			}
 		}
+		
+		exit 0;
 	}
 
 	# I am the parent.
