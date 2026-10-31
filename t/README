@@ -1,0 +1,73 @@
+# memcached.pl Test Suite
+
+This directory contains tests for the memcached.pl implementation.
+
+## Running Tests
+
+### Using make:
+```bash
+make test
+```
+
+### Directly:
+```bash
+perl -I. t/memcached.t
+```
+
+### With verbose output:
+```bash
+PERL_TEST_HARNESS_DUMP_VARS=1 perl -I. t/memcached.t
+```
+
+## Test Coverage
+
+The test suite covers:
+
+### Happy Path Tests
+- Basic set/get operations
+- append/prepend with correct parameters
+- delete existing/non-existing keys
+- incr/decr operations
+- touch command
+- cas operations
+- flush_all
+- stats
+- version
+- quit
+- show_all (custom command)
+- Multi-key get
+- Zero-length data
+- Relative and Unix timestamp expiration
+- noreply option
+
+### Error Case Tests
+- Key validation (too long, control chars, whitespace)
+- Numeric parameter validation (flags, exptime, bytes, cas unique)
+- Data block length validation
+- Invalid command names
+- Malformed commands (wrong parameter count)
+- Negative numeric values
+- Non-numeric values where integers expected
+- 64-bit integer overflow
+- CAS with invalid cas unique
+- Non-existing keys for get, delete, incr, touch
+
+### Edge Cases
+- Empty command line
+- Zero-length data blocks
+- Maximum key length (250 characters)
+- Large expiration times (> 30 days)
+
+## Test Server
+
+The test suite automatically:
+1. Starts a memcached.pl server on port 11999
+2. Runs all tests against it
+3. Cleans up the server process and temporary database after tests complete
+
+## Adding Tests
+
+To add new tests:
+1. Edit `t/memcached.t`
+2. Use `Test::More` functions: `is()`, `like()`, `ok()`, etc.
+3. Follow the existing pattern for sending commands and checking responses
