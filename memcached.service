@@ -1,0 +1,54 @@
+# memcached.pl systemd service file
+#
+# To install and use this service:
+#
+# 1. Copy this file to /etc/systemd/system/:
+#    sudo cp memcached.service /etc/systemd/system/
+#
+# 2. Reload systemd to pick up the new service:
+#    sudo systemctl daemon-reload
+#
+# 3. Start the service:
+#    sudo systemctl start memcached
+#
+# 4. Enable to start on boot:
+#    sudo systemctl enable memcached
+#
+# 5. Check status:
+#    sudo systemctl status memcached
+#
+# 6. Stop the service:
+#    sudo systemctl stop memcached
+#
+# 7. Restart the service:
+#    sudo systemctl restart memcached
+#
+# 8. View logs:
+#    journalctl -u memcached -f
+#
+# Note: The database directory (/tmp/memcached-data) will be automatically
+# created if it doesn't exist. Ensure /tmp has sufficient space and
+# appropriate permissions.
+
+[Unit]
+Description=memcached.pl - Memcached Text Protocol Implementation
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+# Update the path below to point to your memcached.pl script
+ExecStart=/usr/bin/perl /absolute/path/to/memcached.pl --dbdir /tmp/memcached-data --port 11311
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/tmp/memcached-data
+
+[Install]
+WantedBy=multi-user.target
