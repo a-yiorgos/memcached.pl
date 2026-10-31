@@ -4,7 +4,32 @@ An implementation of the [memcached text protocol](http://code.sixapart.com/svn/
 
 ## Overview
 
-This implementation was originally created for debugging and testing purposes. It has been enhanced with:
+**This implementation's primary purpose is to provide the `show_all` command**, which is not available in standard memcached. This allows inspection of all keys and values in the database, making it ideal for debugging, testing, and development purposes.
+
+The implementation has been enhanced with complete protocol support, improved signal handling, and strict protocol compliance.
+
+## Key Feature: show_all Command
+
+The `show_all` command is the **main reason this implementation exists**. Standard memcached does not provide a way to list all keys in the database.
+
+**Usage:**
+```
+show_all
+```
+
+**Response:**
+Returns all keys and their values in the format:
+```
+VALUE <key> <flags> <bytes>\r\n<value>\r\n
+...
+END\r\n
+```
+
+This is the same format as the `get` command, making it compatible with standard memcached clients that parse VALUE responses.
+
+## Additional Features
+
+Beyond the core `show_all` functionality, this implementation includes:
 
 - **Complete protocol support**: All commands described in protocol.txt are implemented
 - **Improved signal handling**: Proper graceful shutdown and zombie process prevention
@@ -118,7 +143,7 @@ perl memcached.pl --listen 0.0.0.0 --port 11211 --dbdir /var/lib/memcached
 
 ## Development Notes
 
-- **Debug command**: `show_all` is a custom command not in protocol.txt, useful for debugging
+- The `show_all` command (documented above) is the primary feature of this implementation
 - **Testing**: Use `telnet` or any memcached client that supports the text protocol
 
 ## License
