@@ -102,6 +102,28 @@ sub validate_key {
 	return (1, undef);
 }
 
+# Validate a numeric parameter (unsigned integer).
+# Returns (1, undef) on success, (0, "error message") on failure.
+# Protocol: flags, bytes, cas unique, exptime must be non-negative integers.
+sub validate_numeric {
+	my ($value, $param_name) = @_;
+	
+	# Check it's a non-negative integer (digits only, no sign, no decimal point)
+	if (!defined($value) || $value !~ m/^\d+$/) {
+		return (0, "$param_name must be a non-negative integer");
+	}
+	
+	# For 64-bit values (cas unique), check it fits in 64 bits
+	if ($param_name eq 'cas unique') {
+		# 2^64-1 = 18446744073709551615
+		if ($value > 18446744073709551615) {
+			return (0, "$param_name exceeds 64-bit unsigned integer limit");
+		}
+	}
+	
+	return (1, undef);
+}
+
 # Read a data block from socket and validate its length.
 # Returns the data on success, dies on error.
 sub read_data_block {
@@ -171,6 +193,25 @@ sub m_set {
 		return;
 	}
 
+	# Validate numeric parameters per protocol
+	my ($flags_valid, $flags_error) = validate_numeric($flags, "flags");
+	if (!$flags_valid) {
+		print $nsock "CLIENT_ERROR $flags_error\r\n";
+		return;
+	}
+	
+	my ($exptime_valid, $exptime_error) = validate_numeric($exptime, "exptime");
+	if (!$exptime_valid) {
+		print $nsock "CLIENT_ERROR $exptime_error\r\n";
+		return;
+	}
+	
+	my ($bytes_valid, $bytes_error) = validate_numeric($bytes, "bytes");
+	if (!$bytes_valid) {
+		print $nsock "CLIENT_ERROR $bytes_error\r\n";
+		return;
+	}
+
 	# Read and validate data block
 	$val = eval { read_data_block($nsock, $bytes) };
 	if ($@) {
@@ -225,6 +266,32 @@ sub m_cas {
 	my ($key_valid, $key_error) = validate_key($key);
 	if (!$key_valid) {
 		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Validate numeric parameters per protocol
+	my ($flags_valid, $flags_error) = validate_numeric($flags, "flags");
+	if (!$flags_valid) {
+		print $nsock "CLIENT_ERROR $flags_error\r\n";
+		return;
+	}
+	
+	my ($exptime_valid, $exptime_error) = validate_numeric($exptime, "exptime");
+	if (!$exptime_valid) {
+		print $nsock "CLIENT_ERROR $exptime_error\r\n";
+		return;
+	}
+	
+	my ($bytes_valid, $bytes_error) = validate_numeric($bytes, "bytes");
+	if (!$bytes_valid) {
+		print $nsock "CLIENT_ERROR $bytes_error\r\n";
+		return;
+	}
+
+	# Validate cas unique for CAS operations (64-bit unsigned integer)
+	my ($cas_valid, $cas_error) = validate_numeric($casunique, "cas unique");
+	if (!$cas_valid) {
+		print $nsock "CLIENT_ERROR $cas_error\r\n";
 		return;
 	}
 
@@ -354,6 +421,25 @@ sub m_add {
 		return;
 	}
 
+	# Validate numeric parameters per protocol
+	my ($flags_valid, $flags_error) = validate_numeric($flags, "flags");
+	if (!$flags_valid) {
+		print $nsock "CLIENT_ERROR $flags_error\r\n";
+		return;
+	}
+	
+	my ($exptime_valid, $exptime_error) = validate_numeric($exptime, "exptime");
+	if (!$exptime_valid) {
+		print $nsock "CLIENT_ERROR $exptime_error\r\n";
+		return;
+	}
+	
+	my ($bytes_valid, $bytes_error) = validate_numeric($bytes, "bytes");
+	if (!$bytes_valid) {
+		print $nsock "CLIENT_ERROR $bytes_error\r\n";
+		return;
+	}
+
 	# Read and validate data block
 	$val = eval { read_data_block($nsock, $bytes) };
 	if ($@) {
@@ -412,7 +498,7 @@ sub m_delete {
 			$noreply = shift(@line);
 			if ($noreply ne "noreply") {
 				undef($noreply);
-				print $nsock "CLIENT_ERROR bad command line format.  Usage: delete <key> [noreply]\r\n";
+				print $nsock "CLIENT_ERROR bad command line format. Usage: delete <key> [noreply]\r\n";
 				return;
 			}
 		}
@@ -696,6 +782,13 @@ sub m_append {
 	my ($key_valid, $key_error) = validate_key($key);
 	if (!$key_valid) {
 		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Validate bytes parameter per protocol (append/prepend don't accept flags/exptime)
+	my ($bytes_valid, $bytes_error) = validate_numeric($bytes, "bytes");
+	if (!$bytes_valid) {
+		print $nsock "CLIENT_ERROR $bytes_error\r\n";
 		return;
 	}
 
