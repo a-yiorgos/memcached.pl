@@ -480,22 +480,22 @@ sub m_show_all {
 }
 
 # append / prepend data to key value
+# Per protocol: append/prepend do NOT accept flags or exptime parameters
 sub m_append {
 	my $noreply;
 	my $len;
 	my $mode = shift(@_);
 	my $lock;
 	my $key;
-	my ($data, $flags, $exptime, $bytes, $casunique, $val);
+	my ($data, $bytes, $casunique, $val);
 	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
 
 	$len = scalar @line;
-	if (($len == 4) or ($len == 5)) {
+	# Protocol: append/prepend only accept: <key> <bytes> [noreply]
+	if (($len == 2) or ($len == 3)) {
 		$key = shift(@line);
-		$flags = shift(@line);
-		$exptime = shift(@line);
 		$bytes = shift(@line);
-		if ($len == 5) {
+		if ($len == 3) {
 			$noreply = shift(@line);
 			if ($noreply ne "noreply") {
 				undef($noreply);
@@ -536,11 +536,8 @@ sub m_append {
 		return;
 	}
 
-	# Per protocol: if exptime > 0 and <= 30 days, treat as relative offset from now.
-	if (($exptime != 0) and ($exptime <= $month)) {
-		$exptime += time();
-	}
-
+	# Per protocol: append/prepend ignore new flags and exptime.
+	# Keep the existing key's flags and exptime.
 	$casunique = set_casunique();
 	if ($mode eq "append") {
 		$val = $oval . $val;
@@ -551,7 +548,8 @@ sub m_append {
 		return;
 	}
 
-	$data = freeze [$flags, $exptime, length($val), $casunique, $val];
+	# Preserve existing flags and exptime from the key
+	$data = freeze [$oflags, $oexptime, length($val), $casunique, $val];
 	$lock = $db->lock();
 	$cache{$key} = $data;
 	$lock->unlock();
