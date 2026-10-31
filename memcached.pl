@@ -32,11 +32,13 @@ our (
 	$cas_pid,
 	%children,
 	$shutdown,
-	$shutdown_lock
+	$shutdown_lock,
+	$MAX_KEY_LENGTH
 );
 
-# Track database shutdown state
+# Initialize global variables
 $shutdown_lock = 0;
+$MAX_KEY_LENGTH = 250;
 
 # Signal handler for forked children.
 # Properly reaps all waiting child processes to prevent zombies.
@@ -74,6 +76,55 @@ sub db_allowed {
 	return !$shutdown_lock;
 }
 
+# Validate a key per protocol requirements.
+# Returns (1, undef) on success, (0, "error message") on failure.
+sub validate_key {
+	my ($key) = @_;
+	
+	# Check key length (max 250 characters)
+	if (length($key) > $MAX_KEY_LENGTH) {
+		return (0, "key too long");
+	}
+	
+	# Check for control characters (ASCII < 32) or DEL (127)
+	if ($key =~ /[\x00-\x1F\x7F]/) {
+		return (0, "key contains control characters");
+	}
+	
+	# Check for whitespace
+	if ($key =~ /\s/) {
+		return (0, "key contains whitespace");
+	}
+	
+	return (1, undef);
+}
+
+# Read a data block from socket and validate its length.
+# Returns the data on success, dies on error.
+sub read_data_block {
+	my ($sock, $expected_bytes) = @_;
+	
+	# Read exactly $expected_bytes + 2 (for \r\n)
+	my $data;
+	my $bytes_read = read($sock, $data, $expected_bytes + 2);
+	
+	if (!defined($bytes_read)) {
+		die "Failed to read data block: $!";
+	}
+	
+	if ($bytes_read < $expected_bytes + 2) {
+		die "Incomplete data block: expected " . ($expected_bytes + 2) . " bytes, got $bytes_read";
+	}
+	
+	# Verify it ends with \r\n
+	if (substr($data, -2) ne "\r\n") {
+		die "Data block not properly terminated with \\r\\n";
+	}
+	
+	# Return data without the trailing \r\n
+	return substr($data, 0, $expected_bytes);
+}
+
 # Request a new CAS value.
 sub set_casunique {
 	my $casunique;
@@ -106,16 +157,26 @@ sub m_set {
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chomp $val;
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
 
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
+	# Read and validate data block
+	$val = eval { read_data_block($nsock, $bytes) };
+	if ($@) {
+		print $nsock "CLIENT_ERROR $@\r\n";
+		return;
+	}
+
+	# Per protocol: if exptime > 0 and <= 30 days, treat as relative offset from now.
+	if (($exptime != 0) and ($exptime <= $month)) {
 		$exptime += time();
 	}
 
@@ -153,13 +214,23 @@ sub m_cas {
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chomp $val;
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Read and validate data block
+	$val = eval { read_data_block($nsock, $bytes) };
+	if ($@) {
+		print $nsock "CLIENT_ERROR $@\r\n";
+		return;
+	}
 
 	# Check whether the key has actually expired first
 	if (defined($cache{$key})) {
@@ -182,8 +253,8 @@ sub m_cas {
 		return;
 	}
 
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
+	# Per protocol: if exptime > 0 and <= 30 days, treat as relative offset from now.
+	if (($exptime != 0) and ($exptime <= $month)) {
 		$exptime += time();
 	}
 
@@ -208,12 +279,18 @@ sub m_get {
 
 	$len = scalar @line;
 	if ($len == 0) {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR no keys specified\r\n";
 		return;
 	}
 
 	# get the keys
 	while ($key = shift(@line)) {
+		# Validate key
+		my ($key_valid, $key_error) = validate_key($key);
+		if (!$key_valid) {
+			print $nsock "CLIENT_ERROR $key_error\r\n";
+			next;
+		}
 		if (defined($cache{$key})) {
 			# Check whether the key has actually expired first
 			my $ref = thaw $cache{$key};
@@ -263,13 +340,23 @@ sub m_add {
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chomp $val;
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Read and validate data block
+	$val = eval { read_data_block($nsock, $bytes) };
+	if ($@) {
+		print $nsock "CLIENT_ERROR $@\r\n";
+		return;
+	}
 
 	# Check whether the key has actually expired first.
 	if (defined($cache{$key})) {
@@ -292,8 +379,8 @@ sub m_add {
 		return;
 	}
 
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
+	# Per protocol: if exptime > 0 and <= 30 days, treat as relative offset from now.
+	if (($exptime != 0) and ($exptime <= $month)) {
 		$exptime += time();
 	}
 
@@ -322,12 +409,19 @@ sub m_delete {
 			$noreply = shift(@line);
 			if ($noreply ne "noreply") {
 				undef($noreply);
-				print $nsock "CLIENT_ERROR bad command line format.  Usage: delete \<key\> [noreply]\r\n";
+				print $nsock "CLIENT_ERROR bad command line format.  Usage: delete <key> [noreply]\r\n";
 				return;
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
 		return;
 	}
 
@@ -408,13 +502,23 @@ sub m_append {
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
 		return;
 	}
 
-	# A better check for the value input is needed.
-	$val = <$nsock>;
-	chomp $val;
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Read and validate data block
+	$val = eval { read_data_block($nsock, $bytes) };
+	if ($@) {
+		print $nsock "CLIENT_ERROR $@\r\n";
+		return;
+	}
 
 	if (defined($cache{$key})) {
 		# Check whether the key has actually expired first
@@ -432,8 +536,8 @@ sub m_append {
 		return;
 	}
 
-	# Is $exptime < $month?
-	if (($exptime != 0) and ($exptime < $month)) {
+	# Per protocol: if exptime > 0 and <= 30 days, treat as relative offset from now.
+	if (($exptime != 0) and ($exptime <= $month)) {
 		$exptime += time();
 	}
 
@@ -491,7 +595,14 @@ sub m_incr {
 			}
 		}
 	} else {
-		print $nsock "ERROR\r\n";
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
 		return;
 	}
 
@@ -552,8 +663,9 @@ $shutdown = 0;
 # EINTR constant
 use Errno qw(EINTR);
 
-# One month in seconds.
-$month = 68 * 60 * 24 * 30;
+# One month in seconds (30 days = 60*60*24*30 seconds).
+# Per protocol: if exptime > this value, treat as Unix time; otherwise as relative offset.
+$month = 60 * 60 * 24 * 30;
 
 # Parse command line options
 my $listen = '127.0.0.1';
