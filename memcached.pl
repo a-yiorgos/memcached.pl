@@ -31,45 +31,47 @@ our (
 	$TO_PARENT,
 	$cas_pid,
 	%children,
-	$shutdown
+	$shutdown,
+	$shutdown_lock
 );
+
+# Track database shutdown state
+$shutdown_lock = 0;
 
 # Signal handler for forked children.
 # Properly reaps all waiting child processes to prevent zombies.
+# Uses minimal operations to avoid async-signal-safety issues.
 sub REAPER {
 	local $!;
-	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
-		delete $children{$waitpid} if exists $children{$waitpid};
+	my $waitpid;
+	# Reap all waiting children non-blocking
+	while (($waitpid = waitpid(-1, WNOHANG)) > 0) {
+		delete $children{$waitpid};
 	}
 	$SIG{CHLD} = \&REAPER;
 }
 
 # Signal handler for graceful shutdown.
+# Sets flag and closes socket to unblock accept().
+# Minimal operations for async-signal-safety.
 sub SHUTDOWN {
 	$shutdown = 1;
-	# Close listening socket to stop accepting new connections
-	close($sock) if $sock && !defined($sock->fileno) || $sock->fileno >= 0;
-	# Signal CAS child to exit
-	if ($cas_pid && kill(0, $cas_pid)) {
-		close($TO_CHILD);
-		close($FROM_CHILD);
-		kill('TERM', $cas_pid);
+	# Close listening socket to unblock accept() in main loop
+	if ($sock) {
+		my $fileno = $sock->fileno;
+		close($sock) if defined($fileno) && $fileno >= 0;
 	}
-	# Kill all active connection children
-	for my $child_pid (keys %children) {
-		kill('TERM', $child_pid) if kill(0, $child_pid);
-	}
-	# Reap all children
-	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
-		delete $children{$waitpid};
-	}
-	exit 0;
+	$SIG{TERM} = \&SHUTDOWN;
+	$SIG{INT} = \&SHUTDOWN;
 }
 
-# Signal handler for SIGPIPE (client disconnected abruptly).
-sub SIGPIPE_HANDLER {
-	# Ignore SIGPIPE - we'll detect it via write errors
-	$SIG{PIPE} = \&SIGPIPE_HANDLER;
+# Set SIGPIPE to IGNORE - built-in Perl constant for signal safety
+$SIG{PIPE} = 'IGNORE';
+
+# Helper function to check if DB operations are allowed
+# Returns 1 if allowed, 0 if shutdown in progress
+sub db_allowed {
+	return !$shutdown_lock;
 }
 
 # Request a new CAS value.
@@ -542,10 +544,13 @@ sub m_incr {
 $SIG{CHLD} = \&REAPER;
 $SIG{TERM} = \&SHUTDOWN;
 $SIG{INT} = \&SHUTDOWN;
-$SIG{PIPE} = \&SIGPIPE_HANDLER;
+# SIGPIPE already set to 'IGNORE' above
 
 # Track shutdown state
 $shutdown = 0;
+
+# EINTR constant
+use Errno qw(EINTR);
 
 # One month in seconds.
 $month = 68 * 60 * 24 * 30;
@@ -611,20 +616,40 @@ $sock = IO::Socket::INET->new(
 	ReuseAddr => 1) or die "cannot open socket: $!\n";
 
 # So now we are ready to handle incoming connections.
+# Use non-blocking accept with timeout to allow shutdown check
+$sock->blocking(0);
+
 while (!$shutdown) {
-	# Accept a connection.
-	$nsock = $sock->accept();
-	next unless $nsock;
+	# Accept a connection with EINTR handling.
+	# Use select with timeout to allow periodic shutdown checks
+	my $rin = '';
+	vec($rin, $sock->fileno, 1) = 1;
+	my $nfound = select($rin, undef, undef, 0.5);
+	
+	if ($nfound > 0) {
+		$nsock = $sock->accept();
+		next unless $nsock;
+	} elsif ($nfound == 0) {
+		# Timeout - check shutdown flag
+		next;
+	} else {
+		# Error on select
+		if ($! != EINTR) {
+			warn "select error: $!";
+			last;
+		}
+		next;
+	}
 
 	# Fork a child.
 	$pid = fork();
 	die "Cannot fork: $!" unless defined($pid);
 	if ($pid == 0) {
 		# I am a child and I am waiting for input.
-		# Set up signal handler for graceful shutdown of connection child
+		# Set up signal handlers for graceful shutdown of connection child
 		$SIG{TERM} = sub { close($nsock); exit 0 };
 		$SIG{INT} = sub { close($nsock); exit 0 };
-		$SIG{PIPE} = sub { close($nsock); exit 0 };
+		$SIG{PIPE} = 'IGNORE';
 		
 		# Note: For the moment we are not checking whether 
 		# commands sent by clients are terminated with \r\n.
@@ -676,29 +701,67 @@ while (!$shutdown) {
 		exit 0;
 	}
 	
-	# I am the parent - track child process
+	# I am the parent - track child process and clear our socket reference
 	$children{$pid} = 1;
+	$nsock = undef;
 }
 
 # Cleanup on shutdown
 SHUTDOWN: {
+	# Signal we're shutting down to prevent new DB operations
+	$shutdown_lock = 1;
+	
 	# Close listening socket
-	close($sock) if $sock;
+	if ($sock) {
+		my $fileno = $sock->fileno;
+		close($sock) if defined($fileno) && $fileno >= 0;
+	}
 	
 	# Signal CAS child to exit if still running
 	if ($cas_pid && kill(0, $cas_pid)) {
-		close($TO_CHILD);
-		close($FROM_CHILD);
+		close($TO_CHILD) if $TO_CHILD && defined($TO_CHILD->fileno);
+		close($FROM_CHILD) if $FROM_CHILD && defined($FROM_CHILD->fileno);
 		kill('TERM', $cas_pid);
-		waitpid($cas_pid, 0);
+		
+		# Wait for CAS child with timeout
+		my $wait_count = 0;
+		while ($wait_count < 10 && kill(0, $cas_pid)) {
+			waitpid($cas_pid, WNOHANG);
+			$wait_count++;
+			sleep 1;
+		}
+		# If still alive after timeout, force kill
+		if (kill(0, $cas_pid)) {
+			kill('KILL', $cas_pid);
+			waitpid($cas_pid, 0);
+		}
 	}
 	
-	# Reap all remaining children
-	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
+	# Signal all active connection children to exit
+	for my $child_pid (keys %children) {
+		kill('TERM', $child_pid) if kill(0, $child_pid);
+	}
+	
+	# Reap all remaining children with timeout
+	my $reap_count = 0;
+	while ($reap_count < 10) {
+		my $waitpid;
+		last unless ($waitpid = waitpid(-1, WNOHANG)) > 0;
 		delete $children{$waitpid};
+		$reap_count++;
+		# If no more children, break early
+		last unless %children;
+		sleep 1;
 	}
 	
-	# Close database
+	# Force kill any remaining stubborn children
+	for my $child_pid (keys %children) {
+		kill('KILL', $child_pid) if kill(0, $child_pid);
+		waitpid($child_pid, 0);
+		delete $children{$child_pid};
+	}
+	
+	# Close database after all children have exited
 	if ($db) {
 		$db->sync();
 		untie %cache;
