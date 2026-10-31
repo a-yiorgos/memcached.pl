@@ -28,16 +28,48 @@ our (
 	$FROM_PARENT,
 	$TO_CHILD,
 	$FROM_CHILD,
-	$TO_PARENT
+	$TO_PARENT,
+	$cas_pid,
+	%children,
+	$shutdown
 );
 
-# Signal handler for forked children. It may need to improve as documented
-# in perlipc.
+# Signal handler for forked children.
+# Properly reaps all waiting child processes to prevent zombies.
 sub REAPER {
-	my $waitpid;
-
-	$waitpid = wait();
+	local $!;
+	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
+		delete $children{$waitpid} if exists $children{$waitpid};
+	}
 	$SIG{CHLD} = \&REAPER;
+}
+
+# Signal handler for graceful shutdown.
+sub SHUTDOWN {
+	$shutdown = 1;
+	# Close listening socket to stop accepting new connections
+	close($sock) if $sock && !defined($sock->fileno) || $sock->fileno >= 0;
+	# Signal CAS child to exit
+	if ($cas_pid && kill(0, $cas_pid)) {
+		close($TO_CHILD);
+		close($FROM_CHILD);
+		kill('TERM', $cas_pid);
+	}
+	# Kill all active connection children
+	for my $child_pid (keys %children) {
+		kill('TERM', $child_pid) if kill(0, $child_pid);
+	}
+	# Reap all children
+	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
+		delete $children{$waitpid};
+	}
+	exit 0;
+}
+
+# Signal handler for SIGPIPE (client disconnected abruptly).
+sub SIGPIPE_HANDLER {
+	# Ignore SIGPIPE - we'll detect it via write errors
+	$SIG{PIPE} = \&SIGPIPE_HANDLER;
 }
 
 # Request a new CAS value.
@@ -506,8 +538,14 @@ sub m_incr {
 	return;
 }
 
-# Set the signal handler.
+# Set signal handlers.
 $SIG{CHLD} = \&REAPER;
+$SIG{TERM} = \&SHUTDOWN;
+$SIG{INT} = \&SHUTDOWN;
+$SIG{PIPE} = \&SIGPIPE_HANDLER;
+
+# Track shutdown state
+$shutdown = 0;
 
 # One month in seconds.
 $month = 68 * 60 * 24 * 30;
@@ -535,9 +573,9 @@ pipe($FROM_CHILD, $TO_PARENT) or die "cannot pipe: $!\n";
 $TO_CHILD->autoflush();
 $TO_PARENT->autoflush();
 
-$pid = fork();
-die "Cannot fork: $!" unless defined($pid);
-if ($pid == 0) {
+$cas_pid = fork();
+die "Cannot fork: $!" unless defined($cas_pid);
+if ($cas_pid == 0) {
 	# I am a child and my job is to produce unique CAS numbers. I do this
 	# by incrementing a counter. Since we have persistence, then
 	# $casunique is persistent too, so we have to iterate among stored 
@@ -545,6 +583,10 @@ if ($pid == 0) {
 	my $key;
 	my ($flags, $exptime, $bytes, $ocasunique, $oval);
 	my $local_casunique = 1;
+
+	# Set up signal handler for graceful shutdown of CAS child
+	$SIG{TERM} = sub { exit 0 };
+	$SIG{INT} = sub { exit 0 };
 
 	foreach $key (keys %cache) {
 		my $ref = thaw $cache{$key};
@@ -569,15 +611,21 @@ $sock = IO::Socket::INET->new(
 	ReuseAddr => 1) or die "cannot open socket: $!\n";
 
 # So now we are ready to handle incoming connections.
-while (1) {
+while (!$shutdown) {
 	# Accept a connection.
 	$nsock = $sock->accept();
+	next unless $nsock;
 
 	# Fork a child.
 	$pid = fork();
 	die "Cannot fork: $!" unless defined($pid);
 	if ($pid == 0) {
 		# I am a child and I am waiting for input.
+		# Set up signal handler for graceful shutdown of connection child
+		$SIG{TERM} = sub { close($nsock); exit 0 };
+		$SIG{INT} = sub { close($nsock); exit 0 };
+		$SIG{PIPE} = sub { close($nsock); exit 0 };
+		
 		# Note: For the moment we are not checking whether 
 		# commands sent by clients are terminated with \r\n.
 		while (my $line = <$nsock>) {
@@ -624,15 +672,40 @@ while (1) {
 			}
 		}
 		
+		close($nsock);
 		exit 0;
 	}
-
-	# I am the parent.
+	
+	# I am the parent - track child process
+	$children{$pid} = 1;
 }
 
-# I never reach here.
-close($sock);
+# Cleanup on shutdown
+SHUTDOWN: {
+	# Close listening socket
+	close($sock) if $sock;
+	
+	# Signal CAS child to exit if still running
+	if ($cas_pid && kill(0, $cas_pid)) {
+		close($TO_CHILD);
+		close($FROM_CHILD);
+		kill('TERM', $cas_pid);
+		waitpid($cas_pid, 0);
+	}
+	
+	# Reap all remaining children
+	while ((my $waitpid = waitpid(-1, WNOHANG)) > 0) {
+		delete $children{$waitpid};
+	}
+	
+	# Close database
+	if ($db) {
+		$db->sync();
+		untie %cache;
+	}
+}
 
+# Normal exit - cleanup already handled in SHUTDOWN block
 __END__
 
 Copyright (c) 2012 Yiorgos Adamopoulos
