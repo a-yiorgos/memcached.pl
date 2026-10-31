@@ -1,0 +1,30 @@
+# Perl
+*.plc
+*.plx
+.pm
+
+# Berkeley DB files
+*.db
+__db.*
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
