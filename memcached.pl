@@ -33,7 +33,10 @@ our (
 	%children,
 	$shutdown,
 	$shutdown_lock,
-	$MAX_KEY_LENGTH
+	$MAX_KEY_LENGTH,
+	$port,
+	$listen,
+	$dbdir
 );
 
 # Initialize global variables
@@ -439,16 +442,199 @@ sub m_delete {
 }
 
 # flush all keys from the database
+# Protocol: flush_all [delay] [noreply]
+# If delay is provided, items are invalidated after that many seconds.
+# For this simple implementation, we don't support delayed invalidation,
+# but we accept the parameter for protocol compliance.
 sub m_flush_all {
+	my $delay;
+	my $noreply;
+	my $len;
 	my $lock;
 	my $key;
 
+	$len = scalar @line;
+	if ($len == 0) {
+		# flush_all with no arguments
+		$delay = 0;
+	} elsif ($len == 1) {
+		# flush_all <delay>
+		$delay = shift(@line);
+		# Validate delay is a non-negative integer
+		if ($delay !~ m/^\d+$/) {
+			print $nsock "CLIENT_ERROR invalid delay\r\n";
+			return;
+		}
+	} elsif ($len == 2) {
+		# flush_all <delay> noreply or flush_all <delay> <noreply>
+		$delay = shift(@line);
+		$noreply = shift(@line);
+		if ($noreply ne "noreply") {
+			# Second argument is not "noreply", treat as invalid
+			print $nsock "CLIENT_ERROR bad command line format\r\n";
+			return;
+		}
+		# Validate delay
+		if ($delay !~ m/^\d+$/) {
+			print $nsock "CLIENT_ERROR invalid delay\r\n";
+			return;
+		}
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	# For this implementation, we immediately invalidate all items
+	# regardless of delay (protocol allows this interpretation).
+	# A full implementation would track expiration times.
 	$lock = $db->lock();
 	foreach $key (keys %cache) {
 		delete $cache{$key};
 	}
 	$lock->unlock();
-	print $nsock "OK\r\n";
+	
+	print $nsock "OK\r\n" unless defined($noreply);
+
+	return;
+}
+
+# Stats command - returns server statistics
+# Protocol: stats [args]
+# For this implementation, we return basic statistics.
+sub m_stats {
+	my $args = shift(@line) if @line;
+	my $lock;
+	
+	if (defined($args) && $args eq "settings") {
+		# Return basic settings
+		print $nsock "STAT maxbytes 1048576\r\n";
+		print $nsock "STAT maxconns 1024\r\n";
+		print $nsock "STAT tcpport $port\r\n";
+		print $nsock "STAT udpport 0\r\n";
+		print $nsock "END\r\n";
+		return;
+	} elsif (defined($args) && $args eq "items") {
+		# Return basic item statistics
+		$lock = $db->lock();
+		my $count = scalar keys %cache;
+		$lock->unlock();
+		print $nsock "STAT items:0:number $count\r\n";
+		print $nsock "END\r\n";
+		return;
+	} elsif (defined($args) && $args eq "slabs") {
+		# Return basic slab statistics (simplified)
+		$lock = $db->lock();
+		my $count = scalar keys %cache;
+		$lock->unlock();
+		print $nsock "STAT 0:chunk_size 96\r\n";
+		print $nsock "STAT 0:chunks_per_page 10922\r\n";
+		print $nsock "STAT 0:total_pages 1\r\n";
+		print $nsock "STAT 0:total_chunks $count\r\n";
+		print $nsock "STAT 0:used_chunks $count\r\n";
+		print $nsock "STAT 0:free_chunks 0\r\n";
+		print $nsock "STAT active_slabs 1\r\n";
+		print $nsock "STAT total_malloced 96\r\n";
+		print $nsock "END\r\n";
+		return;
+	} elsif (defined($args)) {
+		# Unknown stats argument
+		print $nsock "END\r\n";
+		return;
+	}
+	
+	# General statistics (no arguments)
+	$lock = $db->lock();
+	my $curr_items = scalar keys %cache;
+	$lock->unlock();
+	
+	print $nsock "STAT pid $$
+\n";
+	print $nsock "STAT uptime " . (time() - $^T) . "\r\n";
+	print $nsock "STAT time " . time() . "\r\n";
+	print $nsock "STAT version memcached.pl v0.0\r\n";
+	print $nsock "STAT pointer_size " . (64) . "\r\n";
+	print $nsock "STAT rusage_user 0 0\r\n";
+	print $nsock "STAT rusage_system 0 0\r\n";
+	print $nsock "STAT curr_items $curr_items\r\n";
+	print $nsock "STAT total_items $curr_items\r\n";
+	print $nsock "STAT bytes 0\r\n";
+	print $nsock "STAT curr_connections 1\r\n";
+	print $nsock "STAT total_connections 1\r\n";
+	print $nsock "STAT connection_structures 1\r\n";
+	print $nsock "STAT reserved_fds 20\r\n";
+	print $nsock "STAT cmd_get 0\r\n";
+	print $nsock "STAT cmd_set 0\r\n";
+	print $nsock "STAT cmd_flush 0\r\n";
+	print $nsock "STAT cmd_touch 0\r\n";
+	print $nsock "STAT get_hits 0\r\n";
+	print $nsock "STAT get_misses 0\r\n";
+	print $nsock "STAT delete_misses 0\r\n";
+	print $nsock "STAT delete_hits 0\r\n";
+	print $nsock "STAT incr_misses 0\r\n";
+	print $nsock "STAT incr_hits 0\r\n";
+	print $nsock "STAT decr_misses 0\r\n";
+	print $nsock "STAT decr_hits 0\r\n";
+	print $nsock "STAT cas_misses 0\r\n";
+	print $nsock "STAT cas_hits 0\r\n";
+	print $nsock "STAT cas_badval 0\r\n";
+	print $nsock "STAT touch_hits 0\r\n";
+	print $nsock "STAT touch_misses 0\r\n";
+	print $nsock "STAT auth_cmds 0\r\n";
+	print $nsock "STAT auth_errors 0\r\n";
+	print $nsock "STAT evictions 0\r\n";
+	print $nsock "STAT reclaimed 0\r\n";
+	print $nsock "STAT bytes_read 0\r\n";
+	print $nsock "STAT bytes_written 0\r\n";
+	print $nsock "STAT limit_maxbytes 1048576\r\n";
+	print $nsock "STAT threads 1\r\n";
+	print $nsock "END\r\n";
+
+	return;
+}
+
+# Slabs reassign command
+# Protocol: slabs reassign <source class> <dest class>
+# For this implementation, we return OK as we don't have slab classes.
+sub m_slabs_reassign {
+	my $len;
+	my $source;
+	my $dest;
+
+	$len = scalar @line;
+	if ($len == 2) {
+		$source = shift(@line);
+		$dest = shift(@line);
+		# Validate both are integers
+		if ($source !~ m/^\d+$/ || $dest !~ m/^\d+$/) {
+			print $nsock "CLIENT_ERROR invalid slab class\r\n";
+			return;
+		}
+		print $nsock "OK\r\n";
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+	}
+
+	return;
+}
+
+# Slabs automove command
+# Protocol: slabs automove <1|0>
+# For this implementation, we return OK as we don't have slab classes.
+sub m_slabs_automove {
+	my $len;
+	my $mode;
+
+	$len = scalar @line;
+	if ($len == 1) {
+		$mode = shift(@line);
+		if ($mode eq "1" || $mode eq "0") {
+			print $nsock "OK\r\n";
+		} else {
+			print $nsock "CLIENT_ERROR invalid mode\r\n";
+		}
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+	}
 
 	return;
 }
@@ -649,6 +835,68 @@ sub m_incr {
 	return;
 }
 
+# Update expiration time of an existing item without fetching.
+sub m_touch {
+	my $noreply;
+	my $len;
+	my $lock;
+	my $key;
+	my $exptime;
+	my ($oflags, $oexptime, $obytes, $ocasunique, $oval);
+
+	$len = scalar @line;
+	if (($len == 2) or ($len == 3)) {
+		$key = shift(@line);
+		$exptime = shift(@line);
+		if ($len == 3) {
+			$noreply = shift(@line);
+			if ($noreply ne "noreply") {
+				undef($noreply);
+			}
+		}
+	} else {
+		print $nsock "CLIENT_ERROR bad command line format\r\n";
+		return;
+	}
+
+	# Validate key
+	my ($key_valid, $key_error) = validate_key($key);
+	if (!$key_valid) {
+		print $nsock "CLIENT_ERROR $key_error\r\n";
+		return;
+	}
+
+	# Validate exptime is a non-negative integer
+	if ($exptime !~ m/^\d+$/) {
+		print $nsock "CLIENT_ERROR invalid exptime\r\n";
+		return;
+	}
+
+	# Check if key exists
+	if (!defined($cache{$key})) {
+		print $nsock "NOT_FOUND\r\n" unless defined($noreply);
+		return;
+	}
+
+	# Get existing data
+	my $ref = thaw $cache{$key};
+	($oflags, $oexptime, $obytes, $ocasunique, $oval) = @$ref;
+
+	# Apply expiration time rules
+	if ($exptime != 0 && $exptime <= $month) {
+		$exptime += time();
+	}
+
+	# Update with new expiration time, preserving all other fields
+	$lock = $db->lock();
+	$cache{$key} = freeze [$oflags, $exptime, $obytes, $ocasunique, $oval];
+	$lock->unlock();
+	
+	print $nsock "TOUCHED\r\n" unless defined($noreply);
+
+	return;
+}
+
 # Set signal handlers.
 $SIG{CHLD} = \&REAPER;
 $SIG{TERM} = \&SHUTDOWN;
@@ -666,9 +914,9 @@ use Errno qw(EINTR);
 $month = 60 * 60 * 24 * 30;
 
 # Parse command line options
-my $listen = '127.0.0.1';
-my $port = 11311;
-my $dbdir = '.';
+$listen = '127.0.0.1';
+$port = 11311;
+$dbdir = '.';
 GetOptions(
 	'listen=s' => \$listen,
 	'port=i'   => \$port,
@@ -794,8 +1042,20 @@ while (!$shutdown) {
 				m_incr("incr");
 			} elsif ($cmd eq "decr") {
 				m_incr("decr");
+			} elsif ($cmd eq "touch") {
+				m_touch();
 			} elsif ($cmd eq "stats") {
-				print $nsock "SERVER_ERROR command not implemented.\r\n";
+				m_stats();
+			} elsif ($cmd eq "slabs") {
+				# Handle slabs subcommands
+				my $subcmd = shift(@line);
+				if ($subcmd eq "reassign") {
+					m_slabs_reassign();
+				} elsif ($subcmd eq "automove") {
+					m_slabs_automove();
+				} else {
+					print $nsock "CLIENT_ERROR unknown slabs command\r\n";
+				}
 			} elsif ($cmd eq "flush_all") {
 				m_flush_all();
 			} elsif ($cmd eq "show_all") {
